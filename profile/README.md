@@ -668,13 +668,13 @@ Each device calls this on app launch / token refresh. Stored in `users.device_to
 
 ### Deep Link URL Scheme
 
-FocusFlow registers the URL scheme `focusflow://` for cross-device deep links:
+LockInBro registers the URL scheme `lockinbro://` for cross-device deep links:
 
 | URL | Triggered By | Action |
 |-----|-------------|--------|
-| `focusflow://join-session?id={session_id}&open={url_encoded_app_scheme}` | Live Activity tap / Push notification tap | Join session + chain-open target app |
-| `focusflow://resume-session?id={session_id}` | Push notification (session resume) | Open resume card for session |
-| `focusflow://task?id={task_id}` | Push notification (deadline, morning brief) | Open task detail view |
+| `lockinbro://join-session?id={session_id}&open={url_encoded_app_scheme}` | Live Activity tap / Push notification tap | Join session + chain-open target app |
+| `lockinbro://resume-session?id={session_id}` | Push notification (session resume) | Open resume card for session |
+| `lockinbro://task?id={task_id}` | Push notification (deadline, morning brief) | Open task detail view |
 
 The `open` parameter is URL-encoded (e.g., `mobilenotes%3A%2F%2F`). The `onOpenURL` handler decodes it, calls `UIApplication.shared.open()` to chain-open the target app, and joins the session in background.
 
@@ -1149,7 +1149,7 @@ iPad is a productive device — users take notes, write papers, complete homewor
 | Signal | API | How It Works |
 |--------|-----|-------------|
 | User left work apps | DeviceActivityMonitor | Configure a `DeviceActivitySchedule` for the focus session duration. Set monitored apps = everything EXCEPT the user's whitelisted work apps. When cumulative non-whitelisted usage exceeds threshold (default 2 min), the monitor extension fires. |
-| User left FocusFlow | UIApplication lifecycle | `sceneDidEnterBackground` starts a local timer. If user doesn't return within threshold, schedule nudge notification. |
+| User left LockInBro | UIApplication lifecycle | `sceneDidEnterBackground` starts a local timer. If user doesn't return within threshold, schedule nudge notification. |
 | Distraction app launched | FamilyControls + ShieldConfiguration | Same shield system as iPhone — already in spec. Works during iPad focus sessions too. |
 
 #### Work App Whitelist
@@ -1234,7 +1234,7 @@ The core challenge on iPadOS: a background app can't silently open another app. 
 | Visible on lock screen | Until dismissed/cleared | **Always, for entire focus session** |
 | User picks up iPad 20 min later | Notification might be buried | **Still right there on lock screen** |
 | Dynamic content updates | Need new notification each time | **Updates in place** (step changes, progress) |
-| Tap behavior | Opens FocusFlow → chains to target app | Same — but persistent visibility is the key difference |
+| Tap behavior | Opens LockInBro → chains to target app | Same — but persistent visibility is the key difference |
 
 A focus session IS an ongoing activity — exactly what Live Activities were designed for.
 
@@ -1246,21 +1246,21 @@ A focus session IS an ongoing activity — exactly what Live Activities were des
    - **ActivityKit push** (starts Live Activity): persistent lock screen widget showing task title + current step + "Open Notes" — stays visible for the entire session
 3. **Mac advertises `NSUserActivity`** with task context — iPad shows Handoff icon on lock screen / dock as a tertiary entry point
 4. **User picks up iPad** → sees Live Activity on lock screen (or the push notification, or Handoff icon) → **taps once**
-5. **Deep link chain fires** — FocusFlow opens via deep link → `onOpenURL` handler immediately calls `UIApplication.shared.open(targetURL)` **before UI renders** → target app (Notes, Pages, etc.) opens. User sees: tap → Notes opens. FocusFlow flashes for a fraction of a second or not at all.
-6. **FocusFlow joins session in background** — `POST /sessions/{id}/join` called during the deep link handler. DeviceActivityMonitor configured with work app whitelist. Live Activity continues showing on lock screen.
+5. **Deep link chain fires** — LockInBro opens via deep link → `onOpenURL` handler immediately calls `UIApplication.shared.open(targetURL)` **before UI renders** → target app (Notes, Pages, etc.) opens. User sees: tap → Notes opens. LockInBro flashes for a fraction of a second or not at all.
+6. **LockInBro joins session in background** — `POST /sessions/{id}/join` called during the deep link handler. DeviceActivityMonitor configured with work app whitelist. Live Activity continues showing on lock screen.
 7. **Both devices now feed into the same session** — Mac VLM updates steps, iPad tracks app usage + manual step completions. All writes go to the same `steps` table.
 
 #### The Deep Link Chain (Key Implementation Detail)
 
-The trick that makes this feel seamless: handle the deep link and chain-open the target app **before your own UI renders.** The user taps the Live Activity → Notes opens. FocusFlow is just a passthrough.
+The trick that makes this feel seamless: handle the deep link and chain-open the target app **before your own UI renders.** The user taps the Live Activity → Notes opens. LockInBro is just a passthrough.
 
 ```swift
-// FocusFlow deep link handler — fires before UI renders
+// LockInBro deep link handler — fires before UI renders
 .onOpenURL { url in
-    // url = focusflow://join-session?id=xxx&open=mobilenotes%3A%2F%2F
+    // url = lockinbro://join-session?id=xxx&open=mobilenotes%3A%2F%2F
     if let targetScheme = url.queryParam("open"),
        let targetURL = URL(string: targetScheme) {
-        // Chain-open immediately — target app opens before FocusFlow UI appears
+        // Chain-open immediately — target app opens before LockInBro UI appears
         UIApplication.shared.open(targetURL)
         // Join session in background (non-blocking)
         Task { await SessionManager.shared.joinSession(from: url) }
@@ -1307,7 +1307,7 @@ struct FocusSessionAttributes: ActivityAttributes {
 Handoff provides a tertiary entry point — the Handoff icon on iPad's lock screen / dock. Less prominent than the Live Activity, but works even if ActivityKit push fails.
 
 ```swift
-let activity = NSUserActivity(activityType: "com.focusflow.focus-session")
+let activity = NSUserActivity(activityType: "com.lockinbro.focus-session")
 activity.title = "Focus: \(task.title)"
 activity.userInfo = [
     "session_id": session.id.uuidString,
@@ -1384,7 +1384,7 @@ Allows a second device to join an existing active session instead of creating a 
 ## 11. Project Structure
 
 ```
-focusflow/
+lockinbro/
 ├── backend/
 │   ├── app/
 │   │   ├── main.py              # FastAPI app entry, port 3000
