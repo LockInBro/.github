@@ -294,7 +294,7 @@ All timestamps are ISO 8601 UTC.
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| POST | `/distractions/analyze-screenshot` | Desktop sends screenshot (base64) + task/step context. Claude Vision analyzes. Auto-updates step statuses + checkpoint_note. Returns nudge if distracted. |
+| POST | `/distractions/analyze-screenshot` | Desktop sends screenshot (raw JPEG binary via multipart) + task/step context. Claude Vision analyzes. Auto-updates step statuses + checkpoint_note. Returns nudge if distracted. |
 | POST | `/distractions/app-check` | Lightweight mobile pre-launch intercept. Checks distraction list, returns pending task count + most urgent task. |
 | POST | `/distractions/app-activity` | iPad/iPhone reports app-based distraction event (app name, duration). Logs distraction, returns nudge using task context. No screenshot needed. |
 
@@ -530,6 +530,153 @@ task_context: JSON string containing:
   }
 }
 ```
+
+### POST /sessions/start
+
+**Request:**
+```json
+{
+  "task_id": "uuid (optional — session can be taskless)",
+  "platform": "mac | ipad | iphone (default: mac)",
+  "work_app_bundle_ids": ["com.apple.notes", "com.apple.Pages"]
+}
+```
+`work_app_bundle_ids` is optional, used for iPad sessions to configure DeviceActivityMonitor whitelist.
+
+**Response (201):**
+```json
+{
+  "id": "uuid",
+  "user_id": "uuid",
+  "task_id": "uuid | null",
+  "platform": "mac",
+  "started_at": "ISO 8601",
+  "ended_at": null,
+  "status": "active",
+  "checkpoint": {},
+  "created_at": "ISO 8601"
+}
+```
+
+**Backend side-effects:**
+1. Enforces one active session per user — returns 409 if one already exists
+2. Sends push notification to user's other devices (APNs)
+3. Sends ActivityKit push to start Live Activity on iPad (if session started on Mac)
+
+### POST /sessions/{id}/checkpoint
+
+**Request:**
+```json
+{
+  "current_step_id": "uuid (optional)",
+  "last_action_summary": "string (optional)",
+  "next_up": "string (optional)",
+  "goal": "string (optional)",
+  "active_app": "string (optional)",
+  "last_screenshot_analysis": "string (optional)",
+  "attention_score": 72,
+  "distraction_count": 2
+}
+```
+All fields optional — checkpoint is a JSONB merge, so only provided fields are updated.
+
+**Response (200):** Same `SessionOut` shape as start.
+
+### POST /sessions/{id}/end
+
+**Request:**
+```json
+{
+  "status": "completed | interrupted (default: completed)"
+}
+```
+
+**Response (200):** Same `SessionOut` shape with `ended_at` set and status updated.
+
+**Backend side-effects:**
+1. Sets `ended_at = now()`
+2. If other devices are joined, sends push: "Session ended on {platform}. Keep focusing?"
+3. Dismisses Live Activity on iPad via ActivityKit push
+
+### PATCH /tasks/{id}
+
+**Request (all fields optional):**
+```json
+{
+  "title": "Updated title",
+  "description": "Updated description",
+  "priority": 3,
+  "status": "in_progress",
+  "deadline": "ISO 8601",
+  "estimated_minutes": 45,
+  "tags": ["work", "urgent"]
+}
+```
+
+**Response (200):** Full `TaskOut` with updated fields.
+
+### PATCH /steps/{id}
+
+**Request (all fields optional):**
+```json
+{
+  "status": "in_progress | done | skipped",
+  "checkpoint_note": "wrote 3 of 5 paragraphs, results section is next"
+}
+```
+
+**Response (200):**
+```json
+{
+  "id": "uuid",
+  "task_id": "uuid",
+  "sort_order": 2,
+  "title": "Write methods section",
+  "description": null,
+  "estimated_minutes": 10,
+  "status": "in_progress",
+  "checkpoint_note": "wrote 3 of 5 paragraphs, results section is next",
+  "last_checked_at": "ISO 8601",
+  "completed_at": null,
+  "created_at": "ISO 8601"
+}
+```
+
+Used by iPad manual step updates and voice checkpoint notes. Same endpoint the VLM auto-update flow writes to server-side.
+
+### POST /steps/{id}/complete
+
+**Request:** None (empty body).
+
+**Response (200):** Same `StepOut` shape with `status: "done"` and `completed_at` set.
+
+Convenience endpoint — equivalent to `PATCH /steps/{id}` with `{"status": "done"}` but also sets `completed_at = now()`.
+
+### Device Token Registration
+
+**Not yet wired to an endpoint.** The backend has `push.register_device_token(user_id, platform, token)` in `services/push.py` but no router calls it. **Needs a new endpoint:**
+
+```
+POST /auth/device-token
+{
+  "platform": "mac | ipad | iphone",
+  "token": "APNs device token hex string"
+}
+```
+
+Each device calls this on app launch / token refresh. Stored in `users.device_tokens` JSONB as `[{"platform": "ipad", "token": "..."}]`. One token per platform — upserts on conflict.
+
+### Deep Link URL Scheme
+
+FocusFlow registers the URL scheme `focusflow://` for cross-device deep links:
+
+| URL | Triggered By | Action |
+|-----|-------------|--------|
+| `focusflow://join-session?id={session_id}&open={url_encoded_app_scheme}` | Live Activity tap / Push notification tap | Join session + chain-open target app |
+| `focusflow://resume-session?id={session_id}` | Push notification (session resume) | Open resume card for session |
+| `focusflow://task?id={task_id}` | Push notification (deadline, morning brief) | Open task detail view |
+
+The `open` parameter is URL-encoded (e.g., `mobilenotes%3A%2F%2F`). The `onOpenURL` handler decodes it, calls `UIApplication.shared.open()` to chain-open the target app, and joins the session in background.
 
 ---
 
@@ -1375,10 +1522,113 @@ Perceptual hash pre-filter can reduce Vision calls by ~40%, bringing daily cost 
 
 ---
 
-## 14. Key Technical Notes
+## 14. Deployment & Environment
+
+**Server:** DigitalOcean 1GB droplet, Ubuntu, nginx reverse proxy with Certbot SSL at `wahwa.com`
+
+**Backend startup:**
+```bash
+source ~/miniconda3/bin/activate && conda activate lockinbro
+uvicorn app.main:app --host 0.0.0.0 --port 3000 --reload
+```
+
+| Setting | Value |
+|---------|-------|
+| Python | 3.12.13 (conda) |
+| FastAPI root_path | `/api/v1` |
+| Port | 3000 |
+| Database | PostgreSQL `focusapp` on localhost:5432 |
+| SSL | nginx + Certbot (not handled by FastAPI) |
+| Claude model | claude-sonnet-4-20250514 |
+| JWT access token TTL | 60 min |
+| JWT refresh token TTL | 30 days |
+| Password hashing | Argon2id |
+| DB pool | min=2, max=10 (asyncpg) |
+
+**Required `.env` variables:**
+```
+DATABASE_URL=postgresql://root@localhost:5432/focusapp
+JWT_SECRET=<secret>
+ANTHROPIC_API_KEY=<key>
+HEX_API_TOKEN=<token>
+HEX_NB_DISTRACTIONS=<notebook_id>
+HEX_NB_FOCUS_TRENDS=<notebook_id>
+HEX_NB_WEEKLY_REPORT=<notebook_id>
+APPLE_BUNDLE_ID=com.lockinbro.app
+```
+
+**Key dependencies:** FastAPI 0.135.2, SQLAlchemy 2.0.48, asyncpg 0.31.0, anthropic 0.86.0, argon2-cffi 25.1.0, python-jose 3.5.0, httpx 0.28.1
+
+---
+
+## 15. Implementation Status & Remaining Gaps
+
+### Backend (lockinbro-api/) — Implemented
+
+All core endpoints, schemas, services, and migrations are complete. The following is fully functional:
+
+| Component | Status | Notes |
+|-----------|--------|-------|
+| Auth (register, login, Apple, refresh) | Done | Apple token verification skips signature check (hackathon) |
+| Tasks (CRUD, brain-dump, plan) | Done | Includes GET /tasks/upcoming |
+| Steps (list, update, complete) | Done | |
+| Sessions (start, join, checkpoint, end, resume) | Done | Enforces one active session per user |
+| Distractions (screenshot VLM, app-check, app-activity) | Done | VLM auto-updates steps server-side |
+| Analytics (Hex notebooks + direct DB summary) | Done | Returns raw Hex responses |
+| LLM service (6 prompt functions) | Done | Includes suggest_work_apps for handoff |
+| Push service (APNs) | **Stub** | Logs only — see gap #1 below |
+| Database migrations | Done | 2 migrations (initial + cross-device) |
+
+### Remaining Gaps (Must Implement)
+
+**Gap 1: APNs push notifications (`services/push.py`)**
+
+`send_push()` and `send_activity_update()` are stubs that only log. Need real HTTP/2 APNs calls. Required for:
+- Cross-device session handoff notifications
+- ActivityKit Live Activity start/update/dismiss on iPad
+- Smart notifications (deadline approaching, morning brief, etc.)
+
+Requires:
+- APNs `.p8` auth key from Apple Developer account
+- `APNS_KEY_ID`, `APNS_TEAM_ID`, `APNS_KEY_PATH` env vars
+- HTTP/2 client (httpx supports this) to `api.push.apple.com`
+- Two push types: `alert` (notifications) and `liveactivity` (ActivityKit)
+
+**Gap 2: Device token registration endpoint**
+
+`push.register_device_token()` exists in services but is **not wired to any router**. Need:
+
+```
+POST /auth/device-token
+Authorization: Bearer <jwt>
+{
+  "platform": "mac | ipad | iphone",
+  "token": "APNs device token hex string"
+}
+```
+
+Each client calls this on app launch and whenever the APNs token refreshes. Upserts into `users.device_tokens` JSONB.
+
+**Gap 3: Apple identity token verification (`middleware/auth.py`)**
+
+Currently decodes Apple's JWT without signature verification (line 85, marked as hackathon shortcut). Production requires:
+- Fetch Apple's JWKS from `https://appleid.apple.com/auth/keys`
+- Verify RS256 signature, issuer (`https://appleid.apple.com`), audience (bundle ID)
+
+**Gap 4: `prioritize_tasks()` — no endpoint**
+
+`llm.prioritize_tasks()` is implemented in `services/llm.py` but not called by any router. If needed, wire to `POST /tasks/prioritize`.
+
+**Gap 5: `distraction_patterns` table — never populated**
+
+Schema exists (migration 001) but no code writes to it. Could be a background job that aggregates from the `distractions` table, or populated during Hex notebook runs.
+
+---
+
+## 16. Key Technical Notes
 
 - **1GB RAM constraint:** FastAPI + uvicorn ≈ 40–60MB. Postgres already running. Screenshots received as raw JPEG binary (~40–60 KB each at quality 0.5) are transient — GC'd quickly. Stay mindful of concurrent VLM requests (limit to 1–2 in-flight at a time).
 - **Claude Code:** Run from local machine via SSH (`ssh -t` or VS Code Remote), not installed on the droplet. Saves RAM and disk.
 - **VLM prompt context:** The screenshot analysis prompt includes full task context (title, goal, all steps with statuses and checkpoint_notes) so Claude can determine exactly what the user is working on and write accurate checkpoint_note updates.
 - **Step auto-update is a backend side-effect:** When `/distractions/analyze-screenshot` returns, the backend applies step status changes and checkpoint_note updates before returning the response to the client. The client doesn't need to make separate step-update calls.
-- **`blinds_express` reference:** Use the existing bcrypt + JWT patterns from this project as scaffolding reference for the auth module (but replace bcrypt with Argon2).
+- **Auth already implemented:** Backend uses Argon2id hashing + HS256 JWT tokens. Apple Sign In token verification is stubbed for hackathon (decodes without signature check).
