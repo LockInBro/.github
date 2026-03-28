@@ -72,12 +72,12 @@ LockInBro is an ADHD-aware personal AI agent that helps adults with ADHD manage 
 
 **Flow 1: Real-time Distraction Detection (macOS, <2s latency)**
 - ScreenCaptureKit captures a screenshot every 15–30 seconds during an active focus session
-- Screenshot sent as base64 to `POST /distractions/analyze-screenshot` with full task + step context
+- Screenshot sent as raw JPEG binary (quality 0.5, 1280x720) via multipart upload to `POST /distractions/analyze-screenshot` with full task + step context
 - Claude Vision determines: which step user is on, if any steps completed, if user is distracted
 - Backend auto-updates step statuses + writes `checkpoint_note` on the active step
 - If distraction detected and confidence > 0.7, returns gentle nudge → local notification fires
 - Distraction event logged to DB (app name, type, confidence — no screenshot stored)
-- Screenshot discarded from memory after analysis (never persisted). Transient base64, GCs quickly on 1GB box.
+- Screenshot discarded from memory after analysis (never persisted). Transient binary, GCs quickly on 1GB box.
 
 **Flow 2: Brain-Dump Task Parsing (iOS, async)**
 - User speaks or types a stream-of-consciousness dump
@@ -104,7 +104,7 @@ LockInBro is an ADHD-aware personal AI agent that helps adults with ADHD manage 
 
 | Data Type | Storage Policy | Encryption |
 |-----------|---------------|------------|
-| Screenshots | NEVER persisted. Sent as base64, analyzed in-memory, discarded after VLM response. | TLS in transit only |
+| Screenshots | NEVER persisted. Sent as raw JPEG binary via multipart upload, analyzed in-memory, discarded after VLM response. | TLS in transit only |
 | Gaze data | On-device only. Raw coordinates never leave the Mac. Only aggregate attention scores sync. | Keychain-encrypted local store |
 | Task data | Synced to backend, stored in Postgres. | TLS in transit (nginx SSL) |
 | Distraction events | Aggregated: app name, type, confidence, VLM summary text. No images. | TLS in transit |
@@ -422,7 +422,7 @@ All timestamps are ISO 8601 UTC.
 
 **Request:** multipart/form-data
 ```
-screenshot: base64 string (JPEG, 1280x720)
+screenshot: raw JPEG binary (UploadFile, 1280x720, quality 0.5)
 window_title: string
 session_id: UUID
 task_context: JSON string containing:
@@ -868,7 +868,7 @@ async def run_notebook(notebook_key: str, user_id: str) -> dict:
 |-----------|-----------|-------------|
 | Menu Bar Agent | AppKit (NSStatusItem) | Persistent menu bar icon showing focus state. Quick-access to start/stop sessions, view stats. |
 | Focus Session Window | SwiftUI | Floating panel showing current task, current step, step progress, timer, attention score, distraction count. |
-| Screenshot Engine | ScreenCaptureKit | Periodic screen capture during active sessions. Configurable interval (15–60s). Resolution: 1280x720. |
+| Screenshot Engine | ScreenCaptureKit | Periodic screen capture during active sessions. Configurable interval (15–60s). Resolution: 1280x720, JPEG quality 0.5. Sent as raw binary (not base64) to minimize bandwidth (~40–60 KB per frame). |
 | Gaze Tracker | AVFoundation + CoreML | L2CS-Net model converted to CoreML. Tracks where user is looking on screen. |
 | Process Monitor | NSWorkspace | Observes frontmost app changes. Auto-detects work apps and suggests starting a focus session. |
 | Notification Engine | UserNotifications | Delivers distraction alerts with gentle nudges, context reminders, and session prompts. |
@@ -878,7 +878,7 @@ async def run_notebook(notebook_key: str, user_id: str) -> dict:
 1. **Trigger:** Timer fires every N seconds (default 20s) during active focus session
 2. **Capture:** ScreenCaptureKit captures primary display at 1280x720
 3. **Pre-filter:** Compare with previous screenshot using perceptual hash. If >95% similar, skip API call to save cost.
-4. **Analyze:** Send screenshot as base64 to `POST /distractions/analyze-screenshot` with full task + step context (including checkpoint_notes)
+4. **Analyze:** Send screenshot as raw JPEG binary via multipart upload to `POST /distractions/analyze-screenshot` with full task + step context (including checkpoint_notes)
 5. **Auto-update:** Backend receives VLM response. Updates step statuses + writes new `checkpoint_note` on the active step. Updates session checkpoint.
 6. **Act:** If distracted and confidence > 0.7, fire notification with gentle nudge (nudge references specific checkpoint_note progress). If 0.5–0.7, log but don't interrupt.
 7. **Discard:** Delete screenshot from memory. Never write to disk.
@@ -1118,7 +1118,7 @@ Perceptual hash pre-filter can reduce Vision calls by ~40%, bringing daily cost 
 
 ## 14. Key Technical Notes
 
-- **1GB RAM constraint:** FastAPI + uvicorn ≈ 40–60MB. Postgres already running. Screenshots sent as base64 are transient — GC'd quickly. Stay mindful of concurrent VLM requests (limit to 1–2 in-flight at a time).
+- **1GB RAM constraint:** FastAPI + uvicorn ≈ 40–60MB. Postgres already running. Screenshots received as raw JPEG binary (~40–60 KB each at quality 0.5) are transient — GC'd quickly. Stay mindful of concurrent VLM requests (limit to 1–2 in-flight at a time).
 - **Claude Code:** Run from local machine via SSH (`ssh -t` or VS Code Remote), not installed on the droplet. Saves RAM and disk.
 - **VLM prompt context:** The screenshot analysis prompt includes full task context (title, goal, all steps with statuses and checkpoint_notes) so Claude can determine exactly what the user is working on and write accurate checkpoint_note updates.
 - **Step auto-update is a backend side-effect:** When `/distractions/analyze-screenshot` returns, the backend applies step status changes and checkpoint_note updates before returning the response to the client. The client doesn't need to make separate step-update calls.
