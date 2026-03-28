@@ -1,7 +1,7 @@
-# LockInBro — ADHD-Aware Productivity System
+# LockInBro — Cognitive Prosthetic for the ADHD Brain
 
 ## Technical Design Document — YHack 2026 Edition
-**v2.0 · March 28–29, 2026 · Yale University, New Haven CT**
+**v3.0 · March 28–29, 2026 · Yale University, New Haven CT**
 **Platforms:** macOS · iOS · iPadOS
 **Stack:** Swift/SwiftUI · Python/FastAPI · PostgreSQL · Claude API · Hex API · L2CS-Net
 
@@ -21,9 +21,174 @@
 
 LockInBro is an ADHD-aware personal AI agent that helps adults with ADHD manage tasks, resist distractions, and maintain focus through intelligent, real-time intervention. Built for the Apple ecosystem (macOS, iOS, iPadOS), it combines Claude's vision and language capabilities with on-device gaze tracking and Hex-powered analytics to deliver a system that truly adapts to the user's cognitive needs.
 
-**Core thesis:** Instead of requiring the user to adapt to rigid productivity tools, LockInBro is a personal AI agent that adapts to the user — detecting distraction in real-time, parsing unstructured thoughts into actionable tasks, and gently nudging the user back to focus without shame or frustration.
+**Core thesis:** LockInBro is not a productivity tool. It's an external executive function system — the cognitive infrastructure that ADHD brains are missing. The agent perceives your environment (VLM), decides what you should be doing (task prioritization), remembers where you left off (checkpoint notes), detects when you're stuck in a friction loop (proactive pattern detection), and intervenes by DOING the work for you (not just nudging). Each feature replaces a specific executive function deficit: working memory, task initiation, task switching, time perception, and impulse control.
 
 **Why this matters:** 366 million adults worldwide have ADHD. Their brains' executive function systems work differently, making it hard to start tasks, stay on them, manage time, and recover from interruptions. Almost no software is built for cognitive accessibility — this is one of the largest underserved populations in tech.
+
+---
+
+## 1.5. The Proactive Agent Philosophy (Argus Layer)
+
+Traditional AI is reactive: it waits in a chat box for you to articulate your problem. LockInBro's Argus layer shifts the paradigm. It runs in the background, continuously analyzing your screen state over time to detect **friction patterns** — not just "are you distracted?" but "are you struggling with something the AI could handle?"
+
+### Core Proactive Behaviors
+
+**Behavior 1: Repetitive Loop Detection → Auto-Extract**
+The VLM receives a rolling buffer of recent screenshots (not just the current one). When it detects the user switching between the same 2-3 windows repeatedly (image → Calendar, email → spreadsheet, PDF → form), it identifies the pattern and offers to do the work:
+- "I see you're copying events from this schedule image to Calendar. Want me to extract all 14 and populate them?"
+- "You're pulling numbers from this PDF into the spreadsheet. Want me to fill the remaining cells?"
+- User approves → system executes via AppleScript (fast, native) or Claude Computer Use (general, slower).
+
+**Behavior 2: Gaze-Driven Reading Assistant (toggleable)**
+Eye tracking watches where the user is reading on screen. When the user re-reads the same line 3+ times, or stalls on a paragraph for 2x their normal reading speed, the system infers confusion at that specific spot. Without the user asking, an explanation card appears anchored next to where their eyes stalled — defining terms, simplifying concepts, or connecting to earlier material. Your eyes are the query. This is toggleable in settings (off by default, turn on in Settings or via menu bar).
+
+**Behavior 3: Proactive Context Resume**
+When the Argus layer detects the user returning to a previously-active task (e.g., reopening VS Code after 30 minutes away, or switching back to a document), it automatically surfaces the context checkpoint — "You were on 'Write methods section', got through intro and background paragraphs, results paragraph is next." No button press needed; the system recognizes the task resumption from the screen state.
+
+**Behavior 4: Intent Disambiguation**
+When the system detects the user looking at content that could mean different things, it offers MULTIPLE action options instead of guessing:
+- User is looking at a Canvas notification → system offers:
+  - "Add this to your task list?" (skimming mode)
+  - "Help you complete this assignment?" (doing mode)
+  - "Dismiss" (not relevant)
+- The system learns from past choices. After 5+ interactions where the user always picks "add to tasks" for Canvas notifications, it defaults to that and just asks for confirmation.
+
+### Screenshot History Buffer
+
+The proactive detection system requires temporal context — a single screenshot can't detect "user is in a loop." The system maintains a rolling buffer:
+
+- **Capture interval:** 5 seconds per screenshot during active focus sessions
+- **History depth:** 4 screenshots (20-second rolling window)
+- **VLM call frequency:** Every 5 seconds, the VLM receives the current screenshot + summaries of the last 3-4 analyses
+- **Token optimization:** Only the CURRENT screenshot is sent as an image. Previous screenshots are represented as their VLM analysis summaries (text only, ~50 tokens each). This keeps API costs manageable while providing temporal context.
+- **Buffer structure:** `deque(maxlen=4)` of `{screenshot_base64, vlm_analysis_summary, timestamp}`
+
+### Proactive Action Execution
+
+When friction is detected (confidence > 0.7), the system:
+
+1. **Shows a non-intrusive action card** (not a notification — a floating UI element near the relevant screen region):
+   ```
+   ┌──────────────────────────────────────────────┐
+   │ 📋 I noticed you're copying events from an   │
+   │    image to Calendar.                         │
+   │                                               │
+   │  [Extract all 14 events]  [Not now]           │
+   └──────────────────────────────────────────────┘
+   ```
+
+2. **For ambiguous intent, shows multiple options:**
+   ```
+   ┌──────────────────────────────────────────────┐
+   │ 📝 Canvas assignment detected                 │
+   │                                               │
+   │  [Add to task list]  [Help me do it]  [Skip]  │
+   └──────────────────────────────────────────────┘
+   ```
+
+3. **On approval, executes via the fastest available method:**
+   - **Priority 1:** AppleScript/Shortcuts for common macOS actions (instant, reliable)
+   - **Priority 2:** Direct API calls if the target app has one (e.g., Calendar API, Mail API)
+   - **Priority 3:** Claude Computer Use for complex multi-app workflows (slower but general)
+
+4. **Learns from preferences:** Store user choices in a `user_preferences` JSONB field. After 5+ consistent choices for the same pattern type, default to that action and just ask for one-tap confirmation.
+
+### Upgraded VLM Prompt (Friction Detection)
+
+The screenshot analysis prompt is upgraded from simple distraction detection to full friction pattern detection. It receives the current screenshot as an image PLUS text summaries of recent analyses:
+
+```
+System: You are a proactive focus assistant analyzing a user's screen.
+The user's current task and step progress:
+  Task: {task_title}
+  Goal: {task_goal}
+  Steps:
+{formatted_steps_with_statuses_and_checkpoint_notes}
+  Window title reported by OS: {window_title}
+
+Recent screen history (last 15-20 seconds):
+{recent_analysis_summaries}
+
+Analyze the current screenshot in context of recent history. Determine:
+
+1. TASK STATUS: Is the user working on their task? Which step? Any steps completed?
+2. CHECKPOINT: What specific within-step progress have they made?
+3. FRICTION DETECTION: Is the user stuck in any of these patterns?
+   - REPETITIVE_LOOP: Switching between same 2-3 windows (copying data manually)
+   - STALLED: Same screen region with minimal changes for extended time
+   - TEDIOUS_MANUAL: Doing automatable work (filling forms, organizing files, transcribing)
+   - CONTEXT_OVERHEAD: Many windows open, visibly searching across them
+   - TASK_RESUMPTION: User just returned to a task they were working on earlier
+4. INTENT: If viewing informational content (notification, email, document), is the user:
+   - SKIMMING: Quick scan, likely wants to save/bookmark for later
+   - ENGAGED: Reading carefully, likely wants help completing related work
+   - UNCLEAR: Cannot determine — offer multiple options
+5. PROPOSED ACTION: If friction detected, suggest a specific action the AI could take.
+
+Respond ONLY with JSON:
+{
+  "on_task": boolean,
+  "current_step_id": "step UUID or null",
+  "checkpoint_note_update": "within-step progress description or null",
+  "steps_completed": ["UUIDs"],
+  "friction": {
+    "type": "repetitive_loop | stalled | tedious_manual | context_overhead | task_resumption | none",
+    "confidence": 0.0-1.0,
+    "description": "what the user is struggling with",
+    "proposed_actions": [
+      {"label": "Extract all 14 events", "action_type": "auto_extract", "details": "..."},
+      {"label": "Add to task list", "action_type": "brain_dump", "details": "..."}
+    ],
+    "source_context": "what info to extract from",
+    "target_context": "where to put it"
+  },
+  "intent": "skimming | engaged | unclear | null",
+  "distraction_type": "app_switch | browsing | idle | null",
+  "app_name": "string",
+  "confidence": 0.0-1.0,
+  "gentle_nudge": "nudge text if distracted and no friction action applies, null otherwise",
+  "vlm_summary": "1-sentence factual description of screen"
+}
+```
+
+### Notification Priority (Friction Help > Nudge)
+
+When the system detects something, it prioritizes in this order:
+
+1. **Proactive friction help** (blue card, "I can do this for you") — if the system can take a concrete action
+2. **Context resume** (warm card, "Welcome back, here's where you left off") — if task resumption detected
+3. **Gentle drift nudge** (amber, "Hey, you were working on...") — ONLY if no actionable help applies
+
+The system should NEVER nudge when it could help instead. Helping > nagging.
+
+### New DB Table: Proactive Actions Log
+
+```sql
+CREATE TABLE public.proactive_actions (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id         UUID NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+    session_id      UUID REFERENCES public.sessions(id) ON DELETE SET NULL,
+    friction_type   TEXT NOT NULL,          -- repetitive_loop | stalled | tedious_manual | etc.
+    proposed_action TEXT NOT NULL,
+    user_choice     TEXT,                   -- accepted | declined | alternative_chosen
+    chosen_action   TEXT,                   -- what the user actually picked (if multi-option)
+    executed        BOOLEAN DEFAULT false,
+    detected_at     TIMESTAMPTZ DEFAULT now(),
+    responded_at    TIMESTAMPTZ
+);
+
+CREATE INDEX idx_proactive_user ON proactive_actions(user_id, friction_type);
+```
+
+This table feeds into preference learning: query past choices by `friction_type` to determine default actions.
+
+### New API Endpoints for Proactive Actions
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/proactive/respond` | User responds to a proactive action card (accepted/declined/alternative). Logs choice, triggers execution if accepted. |
+| POST | `/proactive/execute` | Execute an approved proactive action (AppleScript, Computer Use, or API). |
+| GET | `/proactive/preferences` | Get learned preferences for action defaults (used by macOS client to pre-select actions). |
 
 ---
 
@@ -1492,23 +1657,24 @@ lockinbro/
 
 ### Build Priority Order
 
-1. **Hour 0–1:** Postgres schema + migrations, auth endpoints, FastAPI scaffold, CoreML conversion
-2. **Hour 1–3:** `POST /tasks/brain-dump` + `POST /tasks/{id}/plan` + `GET /tasks` + `GET /tasks/{id}/steps` — this is the demo centerpiece
-3. **Hour 3–6:** `POST /sessions/start` + checkpoint + `POST /distractions/analyze-screenshot` (with step auto-update + checkpoint_note writes) + macOS screenshot engine
-4. **Hour 6–8:** Wire screenshots to backend, distraction notifications, `GET /sessions/{id}/resume`, Hex setup + distraction_patterns notebook
-5. **Hour 8–12:** iOS brain dump view + task board (with step progress bars), focus_trends Hex notebook, analytics endpoints
-6. **Hour 12–18:** Integration testing, context resume flow end-to-end, dashboard UI, eye tracking integration
-7. **Hour 18–22:** Stretch goals, bug fixes, UI polish
-8. **Hour 22–23:** Record demo video, submit to Devpost
+1. **Hour 0–1:** Postgres schema + migrations (including `proactive_actions` table), auth endpoints, FastAPI scaffold
+2. **Hour 1–3:** `POST /tasks/brain-dump` + `POST /tasks/{id}/plan` + `GET /tasks` + `GET /tasks/{id}/steps` — brain dump is the entry point
+3. **Hour 3–6:** Screenshot analysis pipeline WITH history buffer (5s interval, 4-frame window) + upgraded friction detection VLM prompt + macOS screenshot engine
+4. **Hour 6–9:** ★ **PROACTIVE ACTION SYSTEM** — action card UI on macOS + `/proactive/respond` + `/proactive/execute` + AppleScript templates for Calendar auto-fill, email drafting, form filling. **This is the demo-defining feature. Get it working by hour 9.**
+5. **Hour 9–12:** Context resume as proactive behavior (auto-detect task resumption from screen state) + `GET /sessions/{id}/resume` + intent disambiguation (multi-option cards)
+6. **Hour 12–15:** iOS brain dump view + task board + Hex setup + analytics notebooks
+7. **Hour 15–18:** Integration testing, end-to-end demo flow rehearsal, preference learning from `proactive_actions` table
+8. **Hour 18–21:** Gaze reading assistant (toggleable, stretch goal), UI polish, edge case fixes
+9. **Hour 21–23:** Record demo video, submit to Devpost, rehearse pitch
 
 ### Demo Script (3-minute pitch)
 
-1. **[0:00–0:30] Problem + Stats:** "366M adults with ADHD. No software built for cognitive accessibility. We built LockInBro." *(ASUS track setup)*
-2. **[0:30–1:15] Brain Dump → Steps (live):** Speak a messy thought stream into iPhone. Show Claude parsing into tasks, then breaking a task into 5–15 min steps. *(Harper track: AI agent)*
-3. **[1:15–1:45] Focus Session (live):** Start a session on Mac with a task. Open Twitter mid-session. Show VLM catching it, auto-updating step progress via checkpoint_note, and firing a gentle nudge that references their exact progress. *(Harper track: autonomous agent)*
-4. **[1:45–2:15] Context Resume:** Switch away, come back. Show the AI-generated context card: "You were on 'Write methods section' — got through the intro and background paragraphs. Pick up at the results paragraph." *(Harper track)*
-5. **[2:15–2:45] Analytics Dashboard:** Show the Hex-powered dashboard: distraction patterns by hour, top distracting apps, focus trend chart. *(Hex track)*
-6. **[2:45–3:00] Close:** "This is just the start. On-device VLM, Apple Watch, calendar integration. LockInBro adapts to you."
+1. **[0:00–0:30] Problem + Stats:** "366M adults with ADHD are missing neural hardware. We built the software replacement. LockInBro is a cognitive prosthetic — it perceives your environment, remembers where you left off, detects when you're stuck, and does the work for you." *(ASUS Healthcare + Harper AI Agent setup)*
+2. **[0:30–1:00] Brain Dump → Steps (live):** Speak a messy thought stream into iPhone. Show Claude parsing into tasks, then breaking a task into 5–15 min steps. "This replaces task initiation — the executive function that makes starting feel impossible." *(Harper track: AI agent)*
+3. **[1:00–1:45] ★ PROACTIVE MOMENT — Friction Detection (live, the WOW):**: Start a focus session. Have a JPEG schedule image open next to Apple Calendar. Manually copy 2-3 events. On the 3rd copy, system detects the repetitive loop → action card appears: "I noticed you're copying events from this image to Calendar. Want me to extract all 14?" Click approve. Watch the system auto-populate Calendar. Hands off keyboard. "This replaces the tedious manual work that burns ADHD brains out." *(Harper track: proactive autonomous agent — this is the demo-defining moment)*
+4. **[1:45–2:10] Proactive Context Resume:** Switch away from the task for 30 seconds. Come back to the same app. System AUTOMATICALLY surfaces the context card: "You were on 'Write methods section' — got through the intro and background. Pick up at results." No button pressed. It detected task resumption from the screen state. "This replaces working memory — the executive function that forgets where you were." *(Harper track)*
+5. **[2:10–2:35] Analytics Dashboard:** Show the Hex-powered dashboard: distraction patterns by hour, top distracting apps, focus trend chart, friction events detected. *(Hex track)*
+6. **[2:35–3:00] Gaze Reading Assistant (if working) + Close:** Briefly show gaze-anchored explanation card appearing where eyes stalled on a document. "Your eyes are the query." Close: "This is a cognitive prosthetic. Every feature replaces a specific deficit. LockInBro doesn't watch you. It thinks for you."
 
 ---
 
