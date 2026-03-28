@@ -1409,47 +1409,53 @@ lockinbro/
 │   │                            # anthropic, httpx, python-jose, python-multipart
 │   ├── alembic/                 # DB migrations
 │   └── .env                     # DATABASE_URL, JWT_SECRET, ANTHROPIC_API_KEY, HEX_*
-├── ios/
-│   └── LockInBro/
-│       ├── LockInBroApp.swift
-│       ├── Views/
-│       │   ├── BrainDumpView.swift
-│       │   ├── TaskBoardView.swift
-│       │   ├── DashboardView.swift     # Hex analytics display
-│       │   ├── SettingsView.swift
-│       │   └── iPad/
-│       │       ├── iPadFocusSessionView.swift  # Focus session UI for iPad
-│       │       └── WorkAppPickerView.swift      # Whitelist picker at session start
-│       ├── LiveActivity/
-│       │   ├── FocusSessionLiveActivity.swift   # Lock screen widget UI (step progress, "Open Notes" / "Mark Done")
-│       │   └── FocusSessionAttributes.swift     # ActivityKit attributes + content state
-│       ├── Models/
-│       ├── Services/
-│       │   ├── APIClient.swift
-│       │   ├── SpeechService.swift
-│       │   ├── ScreenTimeManager.swift
-│       │   ├── DeviceActivityManager.swift  # iPad: configures DeviceActivityMonitor for focus sessions
-│       │   └── HandoffReceiver.swift        # Handles NSUserActivity from Mac + session join
-│       └── Shared/
-├── macos/
-│   └── LockInBroMac/
-│       ├── LockInBroMacApp.swift
-│       ├── MenuBar/
-│       │   └── StatusBarController.swift
-│       ├── FocusSession/
-│       │   ├── SessionWindow.swift
-│       │   ├── ScreenshotEngine.swift
-│       │   ├── DistractionDetector.swift
-│       │   ├── ContextCheckpoint.swift
-│       │   └── HandoffAdvertiser.swift      # Publishes NSUserActivity for cross-device handoff
-│       ├── EyeTracking/
-│       │   ├── GazeTracker.swift
-│       │   └── L2CSNet.mlpackage
-│       └── ProcessMonitor/
-│           └── AppWatcher.swift
-└── shared/
-    ├── Models/                   # Shared Swift models (Task, Step, Session)
-    └── Networking/               # Shared API client
+├── LockInBro/                           # iOS + iPadOS — single Xcode project, 4 targets
+│   │                                    # Separate repo/project from macOS (different developer)
+│   ├── LockInBro/                       # Target 1: Main app (universal: iPhone + iPad)
+│   │   ├── LockInBroApp.swift
+│   │   ├── DeepLinkHandler.swift        # onOpenURL → chain-open target app for cross-device handoff
+│   │   ├── Views/
+│   │   │   ├── BrainDumpView.swift
+│   │   │   ├── TaskBoardView.swift
+│   │   │   ├── DashboardView.swift      # Hex analytics display
+│   │   │   ├── SettingsView.swift
+│   │   │   └── iPad/                    # iPad-only views (gated on UIDevice.userInterfaceIdiom == .pad)
+│   │   │       ├── iPadFocusSessionView.swift
+│   │   │       └── WorkAppPickerView.swift
+│   │   ├── Models/                      # Task, Step, Session, etc. (Codable structs)
+│   │   └── Services/
+│   │       ├── APIClient.swift
+│   │       ├── SpeechService.swift
+│   │       ├── ScreenTimeManager.swift
+│   │       ├── DeviceActivityManager.swift  # iPad: configures the monitor extension
+│   │       └── HandoffReceiver.swift        # iPad: handles NSUserActivity from Mac + session join
+│   ├── LockInBroWidgets/                # Target 2: Widget Extension (Live Activity)
+│   │   ├── FocusSessionLiveActivity.swift   # Lock screen widget UI (step progress, "Open Notes" / "Mark Done")
+│   │   └── FocusSessionAttributes.swift     # ActivityKit attributes (shared with main app via App Group)
+│   ├── LockInBroMonitor/                # Target 3: DeviceActivityMonitor Extension
+│   │   └── MonitorExtension.swift       # Fires when off-task app usage exceeds threshold → local notification
+│   └── LockInBroShield/                 # Target 4: ShieldConfiguration Extension
+│       └── ShieldProvider.swift         # Custom shield UI ("Hey, quick check-in!")
+│   # All 4 targets share an App Group (group.com.lockinbro.app) for cross-process data
+│   # Capabilities: FamilyControls, Push Notifications, App Groups on main target
+│
+└── LockInBroMac/                        # macOS — separate Xcode project (different developer)
+    ├── LockInBroMacApp.swift
+    ├── Models/                          # Copy of Task, Step, Session structs (same as iOS)
+    ├── Networking/                      # Copy of APIClient (same backend, same contracts)
+    ├── MenuBar/
+    │   └── StatusBarController.swift
+    ├── FocusSession/
+    │   ├── SessionWindow.swift
+    │   ├── ScreenshotEngine.swift
+    │   ├── DistractionDetector.swift
+    │   ├── ContextCheckpoint.swift
+    │   └── HandoffAdvertiser.swift      # Publishes NSUserActivity for cross-device handoff
+    ├── EyeTracking/
+    │   ├── GazeTracker.swift
+    │   └── L2CSNet.mlpackage
+    └── ProcessMonitor/
+        └── AppWatcher.swift
 ```
 
 ---
