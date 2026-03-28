@@ -1,4 +1,4 @@
-# FocusFlow — ADHD-Aware Productivity System
+# LockInBro — ADHD-Aware Productivity System
 
 ## Technical Design Document — YHack 2026 Edition
 **v2.0 · March 28–29, 2026 · Yale University, New Haven CT**
@@ -9,19 +9,19 @@
 
 ## Target Tracks
 
-| Track | Sponsor | Why FocusFlow Fits | Prize |
+| Track | Sponsor | Why LockInBro Fits | Prize |
 |-------|---------|-------------------|-------|
-| **Personal AI Agent** | Harper (YC-backed) | FocusFlow is a fully autonomous AI agent: observes the user's screen, detects distraction, parses brain-dumps into tasks, generates context checkpoints, and proactively notifies. It automates the executive function that ADHD brains struggle with. | $2,000 + Meta Quest 3s + interview |
-| **Societal Impact / Healthcare** | ASUS | ADHD affects 366M adults globally. FocusFlow is a healthcare/accessibility tool that directly improves quality of life for a severely underserved population. | ASUS GX10 laptop + ZenScreen + ROG gear |
-| **Best Use of Hex API** | Hex | FocusFlow uses the Hex API to power its analytics dashboard: distraction pattern analysis, focus trend visualization, and weekly ADHD behavior reports. | $2,000 / $1,000 / $500 |
+| **Personal AI Agent** | Harper (YC-backed) | LockInBro is a fully autonomous AI agent: observes the user's screen, detects distraction, parses brain-dumps into tasks, generates context checkpoints, and proactively notifies. It automates the executive function that ADHD brains struggle with. | $2,000 + Meta Quest 3s + interview |
+| **Societal Impact / Healthcare** | ASUS | ADHD affects 366M adults globally. LockInBro is a healthcare/accessibility tool that directly improves quality of life for a severely underserved population. | ASUS GX10 laptop + ZenScreen + ROG gear |
+| **Best Use of Hex API** | Hex | LockInBro uses the Hex API to power its analytics dashboard: distraction pattern analysis, focus trend visualization, and weekly ADHD behavior reports. | $2,000 / $1,000 / $500 |
 
 ---
 
 ## 1. Executive Summary
 
-FocusFlow is an ADHD-aware personal AI agent that helps adults with ADHD manage tasks, resist distractions, and maintain focus through intelligent, real-time intervention. Built for the Apple ecosystem (macOS, iOS, iPadOS), it combines Claude's vision and language capabilities with on-device gaze tracking and Hex-powered analytics to deliver a system that truly adapts to the user's cognitive needs.
+LockInBro is an ADHD-aware personal AI agent that helps adults with ADHD manage tasks, resist distractions, and maintain focus through intelligent, real-time intervention. Built for the Apple ecosystem (macOS, iOS, iPadOS), it combines Claude's vision and language capabilities with on-device gaze tracking and Hex-powered analytics to deliver a system that truly adapts to the user's cognitive needs.
 
-**Core thesis:** Instead of requiring the user to adapt to rigid productivity tools, FocusFlow is a personal AI agent that adapts to the user — detecting distraction in real-time, parsing unstructured thoughts into actionable tasks, and gently nudging the user back to focus without shame or frustration.
+**Core thesis:** Instead of requiring the user to adapt to rigid productivity tools, LockInBro is a personal AI agent that adapts to the user — detecting distraction in real-time, parsing unstructured thoughts into actionable tasks, and gently nudging the user back to focus without shame or frustration.
 
 **Why this matters:** 366 million adults worldwide have ADHD. Their brains' executive function systems work differently, making it hard to start tasks, stay on them, manage time, and recover from interruptions. Almost no software is built for cognitive accessibility — this is one of the largest underserved populations in tech.
 
@@ -668,7 +668,7 @@ Respond ONLY with JSON array:
 
 ## 8. Hex API Integration
 
-Hex is a collaborative data platform for analytics notebooks. FocusFlow uses the Hex API to power its analytics layer — distraction pattern analysis, focus trend visualization, and personalized ADHD behavior insights.
+Hex is a collaborative data platform for analytics notebooks. LockInBro uses the Hex API to power its analytics layer — distraction pattern analysis, focus trend visualization, and personalized ADHD behavior insights.
 
 ### Why Hex?
 
@@ -949,7 +949,7 @@ mlmodel.save('L2CSNet.mlpackage')
 - User can dismiss with 5-second hold (friction, not punishment)
 
 ```swift
-struct FocusFlowShield: ShieldConfigurationDataSource {
+struct LockInBroShield: ShieldConfigurationDataSource {
     override func configuration(
         shielding app: Application
     ) -> ShieldConfiguration {
@@ -1013,8 +1013,8 @@ focusflow/
 │   ├── alembic/                 # DB migrations
 │   └── .env                     # DATABASE_URL, JWT_SECRET, ANTHROPIC_API_KEY, HEX_*
 ├── ios/
-│   └── FocusFlow/
-│       ├── FocusFlowApp.swift
+│   └── LockInBro/
+│       ├── LockInBroApp.swift
 │       ├── Views/
 │       │   ├── BrainDumpView.swift
 │       │   ├── TaskBoardView.swift
@@ -1027,8 +1027,8 @@ focusflow/
 │       │   └── ScreenTimeManager.swift
 │       └── Shared/
 ├── macos/
-│   └── FocusFlowMac/
-│       ├── FocusFlowMacApp.swift
+│   └── LockInBroMac/
+│       ├── LockInBroMacApp.swift
 │       ├── MenuBar/
 │       │   └── StatusBarController.swift
 │       ├── FocusSession/
@@ -1091,12 +1091,12 @@ focusflow/
 
 ### Demo Script (3-minute pitch)
 
-1. **[0:00–0:30] Problem + Stats:** "366M adults with ADHD. No software built for cognitive accessibility. We built FocusFlow." *(ASUS track setup)*
+1. **[0:00–0:30] Problem + Stats:** "366M adults with ADHD. No software built for cognitive accessibility. We built LockInBro." *(ASUS track setup)*
 2. **[0:30–1:15] Brain Dump → Steps (live):** Speak a messy thought stream into iPhone. Show Claude parsing into tasks, then breaking a task into 5–15 min steps. *(Harper track: AI agent)*
 3. **[1:15–1:45] Focus Session (live):** Start a session on Mac with a task. Open Twitter mid-session. Show VLM catching it, auto-updating step progress via checkpoint_note, and firing a gentle nudge that references their exact progress. *(Harper track: autonomous agent)*
 4. **[1:45–2:15] Context Resume:** Switch away, come back. Show the AI-generated context card: "You were on 'Write methods section' — got through the intro and background paragraphs. Pick up at the results paragraph." *(Harper track)*
 5. **[2:15–2:45] Analytics Dashboard:** Show the Hex-powered dashboard: distraction patterns by hour, top distracting apps, focus trend chart. *(Hex track)*
-6. **[2:45–3:00] Close:** "This is just the start. On-device VLM, Apple Watch, calendar integration. FocusFlow adapts to you."
+6. **[2:45–3:00] Close:** "This is just the start. On-device VLM, Apple Watch, calendar integration. LockInBro adapts to you."
 
 ---
 
