@@ -235,14 +235,14 @@ This table feeds into preference learning: query past choices by `friction_type`
 
 ### Data Flows
 
-**Flow 1: Real-time Distraction Detection (macOS, <2s latency)**
-- ScreenCaptureKit captures a screenshot every 15–30 seconds during an active focus session
-- Screenshot sent as raw JPEG binary (quality 0.5, 1280x720) via multipart upload to `POST /distractions/analyze-screenshot` with full task + step context
-- Claude Vision determines: which step user is on, if any steps completed, if user is distracted
-- Backend auto-updates step statuses + writes `checkpoint_note` on the active step
-- If distraction detected and confidence > 0.7, returns gentle nudge → local notification fires
-- Distraction event logged to DB (app name, type, confidence — no screenshot stored)
-- Screenshot discarded from memory after analysis (never persisted). Transient binary, GCs quickly on 1GB box.
+**Flow 1: Real-time Friction Detection + Distraction Detection (macOS, device-side VLM)**
+- ScreenCaptureKit captures a screenshot every 5 seconds during an active focus session
+- **VLM runs device-side:** Mac calls Gemini/Claude Vision API directly with current screenshot + text summaries of last 3-4 analyses (rolling `deque(maxlen=4)` buffer). Screenshots never leave the device except to the VLM API.
+- VLM returns enriched JSON: task status, step updates, friction detection (repetitive loops, stalls, tedious manual work), intent, and proposed proactive actions
+- Mac sends **only the JSON result** (no image) to `POST /distractions/analyze-result` on the backend
+- Backend applies side-effects: updates step statuses + `checkpoint_note`, logs distractions, stores proactive actions for preference learning
+- If friction detected (confidence > 0.7): Mac shows action card locally. If distraction detected: Mac shows gentle nudge.
+- Screenshots discarded from device memory after VLM response (never persisted anywhere, never transit through backend)
 
 **Flow 2: Brain-Dump Task Parsing (iOS, async)**
 - User speaks or types a stream-of-consciousness dump
@@ -280,7 +280,7 @@ This table feeds into preference learning: query past choices by `friction_type`
 
 | Data Type | Storage Policy | Encryption |
 |-----------|---------------|------------|
-| Screenshots (macOS only) | NEVER persisted. Sent as raw JPEG binary via multipart upload, analyzed in-memory, discarded after VLM response. | TLS in transit only |
+| Screenshots (macOS only) | NEVER persisted. Analyzed device-side via VLM API call (Gemini/Claude). Only the JSON analysis result is sent to the backend — screenshots never transit through the backend server. | TLS to VLM API only |
 | App activity (iPad) | Only app name + duration sent to backend during focus sessions. No screenshots, no screen content. | TLS in transit |
 | Gaze data | On-device only. Raw coordinates never leave the Mac. Only aggregate attention scores sync. | Keychain-encrypted local store |
 | Task data | Synced to backend, stored in Postgres. | TLS in transit (nginx SSL) |
@@ -459,7 +459,8 @@ All timestamps are ISO 8601 UTC.
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| POST | `/distractions/analyze-screenshot` | Desktop sends screenshot (raw JPEG binary via multipart) + task/step context. Claude Vision analyzes. Auto-updates step statuses + checkpoint_note. Returns nudge if distracted. |
+| POST | `/distractions/analyze-result` | **Primary.** Desktop sends pre-analyzed VLM JSON result (no image). Backend applies side-effects: step updates, distraction logging, proactive action storage. Device-side VLM architecture — screenshots never reach the backend. |
+| POST | `/distractions/analyze-screenshot` | **Legacy fallback.** Desktop sends screenshot (raw JPEG binary via multipart) + task context. Backend runs VLM. For testing or when device-side VLM is unavailable. |
 | POST | `/distractions/app-check` | Lightweight mobile pre-launch intercept. Checks distraction list, returns pending task count + most urgent task. |
 | POST | `/distractions/app-activity` | iPad/iPhone reports app-based distraction event (app name, duration). Logs distraction, returns nudge using task context. No screenshot needed. |
 
@@ -600,33 +601,27 @@ All timestamps are ISO 8601 UTC.
 }
 ```
 
-### POST /distractions/analyze-screenshot
+### POST /distractions/analyze-result (Primary — Device-Side VLM)
 
-**Request:** multipart/form-data
-```
-screenshot: raw JPEG binary (UploadFile, 1280x720, quality 0.5)
-window_title: string
-session_id: UUID
-task_context: JSON string containing:
-  {
-    "task_title": "Finish presentation",
-    "task_goal": "Complete Q1 report slides for Monday meeting",
-    "steps": [
-      {"id": "uuid", "sort_order": 1, "title": "Open template", "status": "done"},
-      {"id": "uuid", "sort_order": 2, "title": "Write methods section", "status": "in_progress",
-       "checkpoint_note": "wrote intro and background paragraphs"},
-      {"id": "uuid", "sort_order": 3, "title": "Create data tables", "status": "pending"}
-    ]
-  }
-```
+The macOS app runs VLM locally (calls Gemini/Claude Vision API directly), then sends **only the JSON result** to the backend. No image ever reaches the server.
 
-**Response (200):**
+**Request:**
 ```json
 {
+  "session_id": "uuid",
   "on_task": false,
   "current_step_id": "uuid-of-step-2",
   "checkpoint_note_update": "wrote intro and background paragraphs, results paragraph is next",
   "steps_completed": ["uuid-of-step-1"],
+  "friction": {
+    "type": "none",
+    "confidence": 0.0,
+    "description": null,
+    "proposed_actions": [],
+    "source_context": null,
+    "target_context": null
+  },
+  "intent": null,
   "distraction_type": "browsing",
   "app_name": "Safari",
   "confidence": 0.92,
@@ -635,10 +630,38 @@ task_context: JSON string containing:
 }
 ```
 
-**Backend side-effects on this response:**
+**Response (200):**
+```json
+{
+  "side_effects_applied": true,
+  "steps_updated": 2,
+  "distraction_logged": true,
+  "proactive_action_id": null
+}
+```
+
+**Backend side-effects:**
 1. `UPDATE steps SET status = 'done', completed_at = now() WHERE id IN (completed step UUIDs)`
 2. `UPDATE steps SET checkpoint_note = '...', last_checked_at = now() WHERE id = current_step_id`
 3. `INSERT INTO distractions (...)` if `on_task = false`
+4. `INSERT INTO proactive_actions (...)` if `friction.type != "none"` and `friction.confidence > 0.7`
+5. Update session checkpoint with latest analysis
+
+### POST /distractions/analyze-screenshot (Legacy Fallback)
+
+For testing or when device-side VLM is unavailable. Backend runs VLM server-side.
+
+**Request:** multipart/form-data
+```
+screenshot: raw JPEG binary (UploadFile, 1280x720, quality 0.5)
+window_title: string
+session_id: UUID
+task_context: JSON string (same shape as before)
+```
+
+**Response:** Same JSON shape as analyze-result request body (the VLM output).
+
+**Backend side-effects:** Same as analyze-result.
 
 ### POST /distractions/app-check
 
@@ -1197,20 +1220,26 @@ async def run_notebook(notebook_key: str, user_id: str) -> dict:
 |-----------|-----------|-------------|
 | Menu Bar Agent | AppKit (NSStatusItem) | Persistent menu bar icon showing focus state. Quick-access to start/stop sessions, view stats. |
 | Focus Session Window | SwiftUI | Floating panel showing current task, current step, step progress, timer, attention score, distraction count. |
-| Screenshot Engine | ScreenCaptureKit | Periodic screen capture during active sessions. Configurable interval (15–60s). Resolution: 1280x720, JPEG quality 0.5. Sent as raw binary (not base64) to minimize bandwidth (~40–60 KB per frame). |
+| Screenshot Engine | ScreenCaptureKit | Periodic screen capture every 5s during active sessions. Resolution: 1280x720, JPEG quality 0.5. Analyzed device-side via VLM API — only JSON results sent to backend. |
+| VLM Client | Gemini/Claude SDK | Device-side VLM calls. Manages rolling `deque(maxlen=4)` of recent analyses. Sends current screenshot + text summaries of previous 3-4 analyses to VLM API. |
+| Proactive Action Cards | SwiftUI | Floating UI elements for friction detection actions. Shows near relevant screen region. Multiple action options for ambiguous intent. |
 | Gaze Tracker | AVFoundation + CoreML | L2CS-Net model converted to CoreML. Tracks where user is looking on screen. |
 | Process Monitor | NSWorkspace | Observes frontmost app changes. Auto-detects work apps and suggests starting a focus session. |
 | Notification Engine | UserNotifications | Delivers distraction alerts with gentle nudges, context reminders, and session prompts. |
 
-### Distraction Detection Pipeline
+### Friction Detection Pipeline (Device-Side VLM)
 
-1. **Trigger:** Timer fires every N seconds (default 20s) during active focus session
-2. **Capture:** ScreenCaptureKit captures primary display at 1280x720
-3. **Pre-filter:** Compare with previous screenshot using perceptual hash. If >95% similar, skip API call to save cost.
-4. **Analyze:** Send screenshot as raw JPEG binary via multipart upload to `POST /distractions/analyze-screenshot` with full task + step context (including checkpoint_notes)
-5. **Auto-update:** Backend receives VLM response. Updates step statuses + writes new `checkpoint_note` on the active step. Updates session checkpoint.
-6. **Act:** If distracted and confidence > 0.7, fire notification with gentle nudge (nudge references specific checkpoint_note progress). If 0.5–0.7, log but don't interrupt.
-7. **Discard:** Delete screenshot from memory. Never write to disk.
+1. **Trigger:** Timer fires every 5 seconds during active focus session
+2. **Capture:** ScreenCaptureKit captures primary display at 1280x720, JPEG quality 0.5
+3. **Pre-filter:** Compare with previous screenshot using perceptual hash. If >95% similar, skip VLM call to save cost.
+4. **Analyze (device-side):** Mac calls Gemini/Claude Vision API directly. Sends current screenshot as image + text summaries of last 3-4 VLM analyses from the rolling `deque(maxlen=4)`. VLM returns enriched JSON with task status, friction detection, intent, and proposed actions.
+5. **Store summary:** Append VLM summary to rolling deque (text only, ~50 tokens). Discard screenshot from memory immediately.
+6. **Send to backend:** `POST /distractions/analyze-result` with only the JSON result (no image). Backend applies DB side-effects (step updates, distraction logs, proactive action storage).
+7. **Act locally:**
+   - Friction detected (confidence > 0.7) → show proactive action card near relevant screen region
+   - Distraction detected (confidence > 0.7) → fire gentle nudge notification
+   - Task resumption detected → auto-surface context resume card
+   - Confidence 0.5–0.7 → log but don't interrupt
 
 ### Eye Tracking Module (L2CS-Net)
 
@@ -1613,9 +1642,13 @@ lockinbro/
     ├── FocusSession/
     │   ├── SessionWindow.swift
     │   ├── ScreenshotEngine.swift
-    │   ├── DistractionDetector.swift
     │   ├── ContextCheckpoint.swift
     │   └── HandoffAdvertiser.swift      # Publishes NSUserActivity for cross-device handoff
+    ├── Argus/                           # Device-side VLM + friction detection
+    │   ├── VLMClient.swift              # Gemini/Claude Vision API calls (device-side)
+    │   ├── AnalysisBuffer.swift         # Rolling deque(maxlen=4) of recent VLM summaries
+    │   ├── FrictionDetector.swift       # Interprets VLM output, triggers action cards
+    │   └── ProactiveActionCard.swift    # SwiftUI floating action card UI
     ├── EyeTracking/
     │   ├── GazeTracker.swift
     │   └── L2CSNet.mlpackage
@@ -1799,8 +1832,9 @@ Schema exists (migration 001) but no code writes to it. Could be a background jo
 
 ## 16. Key Technical Notes
 
-- **1GB RAM constraint:** FastAPI + uvicorn ≈ 40–60MB. Postgres already running. Screenshots received as raw JPEG binary (~40–60 KB each at quality 0.5) are transient — GC'd quickly. Stay mindful of concurrent VLM requests (limit to 1–2 in-flight at a time).
+- **1GB RAM constraint:** FastAPI + uvicorn ≈ 40–60MB. Postgres already running. With device-side VLM, the backend never handles screenshots — only receives small JSON results (~1KB each). No VLM memory pressure on the droplet.
+- **Device-side VLM architecture:** Screenshots are captured and analyzed on the Mac via direct Gemini/Claude API calls. Backend receives only pre-analyzed JSON via `POST /distractions/analyze-result`. This eliminates image upload bandwidth, reduces latency (one fewer hop), strengthens privacy (screenshots never transit through backend), and keeps the droplet RAM-safe. The legacy `analyze-screenshot` endpoint remains as a fallback for testing.
 - **Claude Code:** Run from local machine via SSH (`ssh -t` or VS Code Remote), not installed on the droplet. Saves RAM and disk.
-- **VLM prompt context:** The screenshot analysis prompt includes full task context (title, goal, all steps with statuses and checkpoint_notes) so Claude can determine exactly what the user is working on and write accurate checkpoint_note updates.
-- **Step auto-update is a backend side-effect:** When `/distractions/analyze-screenshot` returns, the backend applies step status changes and checkpoint_note updates before returning the response to the client. The client doesn't need to make separate step-update calls.
+- **VLM prompt context:** The upgraded Argus prompt includes task context + rolling history of recent analyses (text summaries, not images). The Mac manages the `deque(maxlen=4)` buffer locally.
+- **Step auto-update is a backend side-effect:** When `/distractions/analyze-result` receives VLM output, the backend applies step status changes, checkpoint_note updates, and proactive action logging before responding.
 - **Auth already implemented:** Backend uses Argon2id hashing + HS256 JWT tokens. Apple Sign In token verification is stubbed for hackathon (decodes without signature check).
