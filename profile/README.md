@@ -93,18 +93,30 @@ LockInBro is an ADHD-aware personal AI agent that helps adults with ADHD manage 
 - On interruption, checkpoint saved → `POST /sessions/{id}/checkpoint`
 - On return → `GET /sessions/{id}/resume` → AI-generated context card: "You were on 'Write methods section' — you got through 3 of 5 paragraphs. Pick up at the results paragraph."
 
-**Flow 4: Analytics Pipeline (Hex API, async/batch)**
+**Flow 4: iPad Focus Session (iPadOS, app-based detection)**
+- User starts focus session on iPad → `POST /sessions/start` with `platform: "ipad"` + work app whitelist, OR joins existing Mac session via `POST /sessions/{id}/join` (triggered by tapping Live Activity / push notification / Handoff icon)
+- Live Activity starts on lock screen showing current step, progress, and "Open [Work App]" button — persists for entire session, updated via ActivityKit push as Mac VLM detects step changes
+- DeviceActivityMonitor configured: threshold = 2 min cumulative on non-whitelisted apps
+- User works in whitelisted apps (Notes, Pages, etc.) — no network calls during on-task time
+- If user drifts to non-whitelisted app for >2 min → monitor extension fires → local notification with gentle nudge
+- Distraction logged via `POST /distractions/app-activity` (app name + duration, no screenshot)
+- Step progress tracked via Live Activity "Mark Done" button + periodic check-in notifications + optional voice checkpoint notes
+- Step updates written to same `steps` table via same endpoints — task list stays unified across Mac + iPad
+- On return from distraction → `GET /sessions/{id}/resume` → same AI resume card flow as macOS
+
+**Flow 5: Analytics Pipeline (Hex API, async/batch)**
 - Backend writes distraction events, session data, and task completion data to Postgres
 - Hex notebooks query Postgres directly via DB connection
 - Hex computes: distraction frequency by app, focus duration trends, peak productivity windows, task completion rates
-- Results fetched from Hex API and displayed in the iOS/macOS dashboard
+- Results fetched from Hex API and displayed in the iOS/iPad/macOS dashboard
 - Weekly summary report generated as a Hex notebook run and surfaced as a push notification
 
 ### Privacy Architecture
 
 | Data Type | Storage Policy | Encryption |
 |-----------|---------------|------------|
-| Screenshots | NEVER persisted. Sent as raw JPEG binary via multipart upload, analyzed in-memory, discarded after VLM response. | TLS in transit only |
+| Screenshots (macOS only) | NEVER persisted. Sent as raw JPEG binary via multipart upload, analyzed in-memory, discarded after VLM response. | TLS in transit only |
+| App activity (iPad) | Only app name + duration sent to backend during focus sessions. No screenshots, no screen content. | TLS in transit |
 | Gaze data | On-device only. Raw coordinates never leave the Mac. Only aggregate attention scores sync. | Keychain-encrypted local store |
 | Task data | Synced to backend, stored in Postgres. | TLS in transit (nginx SSL) |
 | Distraction events | Aggregated: app name, type, confidence, VLM summary text. No images. | TLS in transit |
@@ -127,6 +139,7 @@ CREATE TABLE public.users (
     display_name    TEXT,
     timezone        TEXT DEFAULT 'America/Chicago',
     distraction_apps TEXT[] DEFAULT '{}',
+    device_tokens   JSONB DEFAULT '[]',      -- APNs push tokens: [{"platform": "ipad", "token": "..."}]
     preferences     JSONB DEFAULT '{}',      -- notification schedule, energy windows, etc.
     created_at      TIMESTAMPTZ DEFAULT now(),
     updated_at      TIMESTAMPTZ DEFAULT now(),
@@ -172,13 +185,15 @@ CREATE TABLE public.sessions (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id         UUID NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
     task_id         UUID REFERENCES public.tasks(id) ON DELETE SET NULL,
+    platform        TEXT NOT NULL,            -- mac | ipad | iphone
     started_at      TIMESTAMPTZ DEFAULT now(),
     ended_at        TIMESTAMPTZ,
     status          TEXT DEFAULT 'active',   -- active | completed | interrupted
     checkpoint      JSONB DEFAULT '{}',
     -- checkpoint shape: {current_step_id, last_action_summary,
     --                     next_up, goal, active_app, last_screenshot_analysis,
-    --                     attention_score, distraction_count}
+    --                     attention_score, distraction_count,
+    --                     work_app_bundle_ids (iPad only)}
     created_at      TIMESTAMPTZ DEFAULT now()
 );
 
@@ -272,6 +287,7 @@ All timestamps are ISO 8601 UTC.
 | POST | `/sessions/start` | Start focus session, optionally linked to a task. Returns full task context + all steps. |
 | POST | `/sessions/{id}/checkpoint` | Save context checkpoint (current step, last action, attention score, active app) |
 | POST | `/sessions/{id}/end` | End session with status (completed / interrupted) |
+| POST | `/sessions/{id}/join` | Second device joins an active session. Returns full task context + suggested work app. Avoids duplicate sessions. |
 | GET | `/sessions/{id}/resume` | Get last checkpoint + step checkpoint_notes → AI-generated resume card |
 
 ### Distraction Detection
@@ -280,6 +296,7 @@ All timestamps are ISO 8601 UTC.
 |--------|----------|-------------|
 | POST | `/distractions/analyze-screenshot` | Desktop sends screenshot (base64) + task/step context. Claude Vision analyzes. Auto-updates step statuses + checkpoint_note. Returns nudge if distracted. |
 | POST | `/distractions/app-check` | Lightweight mobile pre-launch intercept. Checks distraction list, returns pending task count + most urgent task. |
+| POST | `/distractions/app-activity` | iPad/iPhone reports app-based distraction event (app name, duration). Logs distraction, returns nudge using task context. No screenshot needed. |
 
 ### Analytics (Hex-Powered)
 
@@ -974,6 +991,236 @@ struct LockInBroShield: ShieldConfigurationDataSource {
 }
 ```
 
+### iPad Focus Sessions
+
+iPad is a productive device — users take notes, write papers, complete homework. Unlike iPhone (passive task management) and macOS (screenshot VLM analysis), iPad gets its own focus session model based on **active app monitoring + timed check-ins**.
+
+**Why not screenshots?** iPadOS sandboxing prevents apps from capturing other apps' screens. No ScreenCaptureKit equivalent exists. Instead, we use the Screen Time framework (`DeviceActivityMonitor`) to detect when the user drifts to non-work apps, and periodic check-in prompts for step progress.
+
+#### Detection Model
+
+| Signal | API | How It Works |
+|--------|-----|-------------|
+| User left work apps | DeviceActivityMonitor | Configure a `DeviceActivitySchedule` for the focus session duration. Set monitored apps = everything EXCEPT the user's whitelisted work apps. When cumulative non-whitelisted usage exceeds threshold (default 2 min), the monitor extension fires. |
+| User left FocusFlow | UIApplication lifecycle | `sceneDidEnterBackground` starts a local timer. If user doesn't return within threshold, schedule nudge notification. |
+| Distraction app launched | FamilyControls + ShieldConfiguration | Same shield system as iPhone — already in spec. Works during iPad focus sessions too. |
+
+#### Work App Whitelist
+
+When starting a focus session on iPad, the user picks which apps are "on-task" for this session:
+
+- **AI-suggested:** Backend infers likely work apps from the task title/description (e.g., "Write essay" → Notes, Pages, Google Docs, Safari)
+- **User-curated:** User can add/remove from the suggestion
+- **Remembered:** Whitelist saved per-task, reused on future sessions
+
+```
+POST /sessions/start
+{
+  "task_id": "uuid",
+  "platform": "ipad",
+  "work_app_bundle_ids": ["com.apple.notes", "com.apple.Pages", "com.google.docs"]
+}
+```
+
+#### Distraction Detection Pipeline (iPad)
+
+1. **Start:** User starts focus session → app configures `DeviceActivityMonitor` with threshold (default 2 min off-task)
+2. **Monitor:** DeviceActivityMonitor tracks cumulative time on non-whitelisted apps
+3. **Threshold hit:** Monitor extension fires → sends local notification with gentle nudge + current step context
+4. **Log:** App sends distraction event to `POST /distractions/app-activity` with app name + duration
+5. **Return:** User taps notification → app shows resume card via `GET /sessions/{id}/resume`
+
+#### Step Progress Tracking (iPad)
+
+Without VLM, step progress uses a **periodic check-in + manual update** model:
+
+| Mechanism | How | Frequency |
+|-----------|-----|-----------|
+| Live Activity | Lock screen widget showing current step title, progress bar, + "Mark Done" button. Same Live Activity used for cross-device handoff — updated via ActivityKit push when Mac VLM detects step changes. | Always visible during session |
+| Periodic check-in | Local notification: "How's '{step_title}' going? Tap to mark done or update." | Every 10–15 min (configurable) |
+| Voice update | User can voice-dictate a quick checkpoint note (on-device Speech → text saved as `checkpoint_note`) | On demand |
+| Time-based suggestion | If user spends ≥ `estimated_minutes` in whitelisted apps, suggest: "Looks like you've been at '{step_title}' for a while — ready to mark it done?" | Triggered by timer |
+
+The backend writes `checkpoint_note` updates and step status changes through the same endpoints the macOS VLM flow uses — the task list stays unified across devices.
+
+#### New Endpoint: POST /distractions/app-activity
+
+Lightweight endpoint for iPad (and iPhone) to report app-based distraction events without screenshots:
+
+```
+POST /distractions/app-activity
+{
+  "session_id": "uuid",
+  "app_bundle_id": "com.instagram.ios",
+  "app_name": "Instagram",
+  "duration_seconds": 145,
+  "returned_to_task": true
+}
+```
+
+**Response (200):**
+```json
+{
+  "distraction_logged": true,
+  "session_distraction_count": 3,
+  "gentle_nudge": "Instagram grabbed your attention for a couple minutes. No worries — you were on 'Write intro paragraph'. Pick up where you left off!"
+}
+```
+
+**Backend side-effects:**
+1. `INSERT INTO distractions (...)` with `distraction_type = 'app_switch'`
+2. Update session checkpoint `distraction_count`
+3. Generate nudge using task + step + checkpoint_note context (Claude text, not Vision — cheap)
+
+### Cross-Device Session Handoff
+
+When a user starts a focus session on one device, other devices can join that session — so the task list, step progress, and distraction tracking stay unified. The primary use case: user researches on Mac, takes notes on iPad.
+
+#### How It Works: Push Notification + Live Activity + Deep Link Chain
+
+The core challenge on iPadOS: a background app can't silently open another app. No Shortcuts workaround reliably solves this (Shortcuts can't dynamically choose a target app, and "Open App" doesn't execute while the device is locked). Instead, we use a **push notification as the initial alert** and a **Live Activity as the persistent, always-visible prompt** — both requiring just one tap to reach the target app.
+
+**Why Live Activity is the right mechanism:**
+
+| | Push Notification | Live Activity |
+|---|---|---|
+| Visible on lock screen | Until dismissed/cleared | **Always, for entire focus session** |
+| User picks up iPad 20 min later | Notification might be buried | **Still right there on lock screen** |
+| Dynamic content updates | Need new notification each time | **Updates in place** (step changes, progress) |
+| Tap behavior | Opens FocusFlow → chains to target app | Same — but persistent visibility is the key difference |
+
+A focus session IS an ongoing activity — exactly what Live Activities were designed for.
+
+#### Handoff Flow
+
+1. **Mac starts session** → `POST /sessions/start` with `platform: "mac"`
+2. **Backend sends two things to iPad via APNs:**
+   - **Push notification** (initial alert): "Focus session active: 'Take notes on Q1 report'. Tap to join on iPad." **[Join on iPad]** — **[Dismiss]**
+   - **ActivityKit push** (starts Live Activity): persistent lock screen widget showing task title + current step + "Open Notes" — stays visible for the entire session
+3. **Mac advertises `NSUserActivity`** with task context — iPad shows Handoff icon on lock screen / dock as a tertiary entry point
+4. **User picks up iPad** → sees Live Activity on lock screen (or the push notification, or Handoff icon) → **taps once**
+5. **Deep link chain fires** — FocusFlow opens via deep link → `onOpenURL` handler immediately calls `UIApplication.shared.open(targetURL)` **before UI renders** → target app (Notes, Pages, etc.) opens. User sees: tap → Notes opens. FocusFlow flashes for a fraction of a second or not at all.
+6. **FocusFlow joins session in background** — `POST /sessions/{id}/join` called during the deep link handler. DeviceActivityMonitor configured with work app whitelist. Live Activity continues showing on lock screen.
+7. **Both devices now feed into the same session** — Mac VLM updates steps, iPad tracks app usage + manual step completions. All writes go to the same `steps` table.
+
+#### The Deep Link Chain (Key Implementation Detail)
+
+The trick that makes this feel seamless: handle the deep link and chain-open the target app **before your own UI renders.** The user taps the Live Activity → Notes opens. FocusFlow is just a passthrough.
+
+```swift
+// FocusFlow deep link handler — fires before UI renders
+.onOpenURL { url in
+    // url = focusflow://join-session?id=xxx&open=mobilenotes%3A%2F%2F
+    if let targetScheme = url.queryParam("open"),
+       let targetURL = URL(string: targetScheme) {
+        // Chain-open immediately — target app opens before FocusFlow UI appears
+        UIApplication.shared.open(targetURL)
+        // Join session in background (non-blocking)
+        Task { await SessionManager.shared.joinSession(from: url) }
+    }
+}
+```
+
+#### Live Activity: Lock Screen Widget
+
+The Live Activity stays on the iPad lock screen for the entire focus session, updated in real-time via ActivityKit push notifications as the Mac's VLM detects step progress:
+
+```
+┌─────────────────────────────────────────────┐
+│  📝 Focus: Take notes on Q1 report          │
+│  Current step: Write methods section         │
+│  Progress: ██████░░░░ 3/5 steps              │
+│                                              │
+│              [ Open Notes ]                  │
+└─────────────────────────────────────────────┘
+```
+
+- **"Open Notes" button** → deep link with target app scheme → chain-open
+- **Step/progress updates** → backend sends ActivityKit push when VLM updates step status on Mac
+- **Session ends** → Live Activity dismissed automatically
+
+```swift
+// ActivityKit: define the Live Activity attributes
+struct FocusSessionAttributes: ActivityAttributes {
+    let sessionId: String
+    let taskTitle: String
+
+    struct ContentState: Codable, Hashable {
+        let currentStepTitle: String
+        let completedSteps: Int
+        let totalSteps: Int
+        let suggestedAppScheme: String
+        let suggestedAppName: String
+    }
+}
+```
+
+#### NSUserActivity Setup (macOS Side)
+
+Handoff provides a tertiary entry point — the Handoff icon on iPad's lock screen / dock. Less prominent than the Live Activity, but works even if ActivityKit push fails.
+
+```swift
+let activity = NSUserActivity(activityType: "com.focusflow.focus-session")
+activity.title = "Focus: \(task.title)"
+activity.userInfo = [
+    "session_id": session.id.uuidString,
+    "task_id": task.id.uuidString,
+    "current_step_id": currentStep.id.uuidString,
+    "suggested_app_scheme": "mobilenotes://"
+]
+activity.isEligibleForHandoff = true
+activity.becomeCurrent()
+```
+
+#### New Endpoint: POST /sessions/{id}/join
+
+Allows a second device to join an existing active session instead of creating a duplicate:
+
+```json
+// Request
+{
+  "platform": "ipad",
+  "work_app_bundle_ids": ["com.apple.notes", "com.apple.Pages"]
+}
+```
+
+```json
+// Response (200)
+{
+  "session_id": "uuid",
+  "joined": true,
+  "task": {
+    "id": "uuid",
+    "title": "Take notes on Q1 report webpage",
+    "goal": "Summarize key findings from the Q1 data"
+  },
+  "current_step": {
+    "id": "uuid",
+    "title": "Read through methodology section",
+    "status": "in_progress",
+    "checkpoint_note": "skimmed intro, starting on data tables"
+  },
+  "all_steps": [ /* full step list with statuses */ ],
+  "suggested_app_scheme": "mobilenotes://",
+  "suggested_app_name": "Notes"
+}
+```
+
+**Backend side-effects:**
+1. Add `platform` entry to session checkpoint: `checkpoint.devices = ["mac", "ipad"]`
+2. Store iPad's `work_app_bundle_ids` in checkpoint for DeviceActivityMonitor config
+3. Push notifications and ActivityKit updates for this session now route to both devices
+
+#### Multi-Device Session Rules
+
+| Scenario | Behavior |
+|----------|----------|
+| Mac ends session while iPad is joined | iPad Live Activity updates: "Session ended on Mac. Keep focusing?" with [Keep Going] / [End Session]. If keep going, session stays active with iPad as primary. |
+| iPad joins, then user goes off-task on iPad | Normal iPad distraction flow (DeviceActivityMonitor → nudge). Mac session unaffected. |
+| Both devices update the same step simultaneously | Last-write-wins on `checkpoint_note` (fine — Mac VLM writes every 20s, iPad writes on manual action). Step `status` transitions are idempotent (pending→in_progress→done). |
+| User starts a NEW session on iPad for same task | Backend detects active session for this task, prompts: "You have an active session on Mac. Join that one instead?" |
+| Mac VLM completes a step | Backend sends ActivityKit push → iPad Live Activity updates in place (progress bar advances, current step changes). |
+
 ### Smart Notifications
 
 | Type | Trigger | Example |
@@ -982,6 +1229,8 @@ struct LockInBroShield: ShieldConfigurationDataSource {
 | Morning Brief | Daily at user-configured time | "Good morning! You have 3 tasks today. Top priority: Email Sarah. First step: Open email client (~2 min)." |
 | Focus Streak | 3+ consecutive sessions completed | "3 focus sessions today! You're on a roll." |
 | Gentle Nudge | No task activity for 4+ hours | "Just checking in. Your task list has 2 urgent items. No pressure!" |
+| Cross-Device Handoff | Focus session started on another device | Push: "Focus session active on Mac: 'Take notes on Q1 report'. Tap to join." + Live Activity starts on lock screen with task/step/progress and "Open Notes" button. |
+| Session Ended on Other Device | Joined session ended by primary device | Live Activity updates: "Session ended on Mac. Keep focusing?" [Keep Going] / [End Session] |
 
 ---
 
@@ -999,13 +1248,14 @@ focusflow/
 │   │   │   ├── auth.py          # register + login + apple
 │   │   │   ├── tasks.py         # CRUD + brain-dump + plan
 │   │   │   ├── steps.py         # step updates
-│   │   │   ├── sessions.py      # start + checkpoint + end + resume
-│   │   │   ├── distractions.py  # analyze-screenshot + app-check
+│   │   │   ├── sessions.py      # start + checkpoint + end + resume + join
+│   │   │   ├── distractions.py  # analyze-screenshot + app-check + app-activity
 │   │   │   └── analytics.py     # Hex-powered endpoints
 │   │   ├── services/
 │   │   │   ├── llm.py           # Claude API wrapper (all prompts)
 │   │   │   ├── hex_service.py   # Hex API client
-│   │   │   └── db.py            # asyncpg Postgres client
+│   │   │   ├── db.py            # asyncpg Postgres client
+│   │   │   └── push.py          # APNs client (push notifications + ActivityKit push for Live Activity updates)
 │   │   ├── models.py            # Pydantic schemas
 │   │   └── types.py
 │   ├── requirements.txt         # fastapi, uvicorn, asyncpg, argon2-cffi,
@@ -1019,12 +1269,20 @@ focusflow/
 │       │   ├── BrainDumpView.swift
 │       │   ├── TaskBoardView.swift
 │       │   ├── DashboardView.swift     # Hex analytics display
-│       │   └── SettingsView.swift
+│       │   ├── SettingsView.swift
+│       │   └── iPad/
+│       │       ├── iPadFocusSessionView.swift  # Focus session UI for iPad
+│       │       └── WorkAppPickerView.swift      # Whitelist picker at session start
+│       ├── LiveActivity/
+│       │   ├── FocusSessionLiveActivity.swift   # Lock screen widget UI (step progress, "Open Notes" / "Mark Done")
+│       │   └── FocusSessionAttributes.swift     # ActivityKit attributes + content state
 │       ├── Models/
 │       ├── Services/
 │       │   ├── APIClient.swift
 │       │   ├── SpeechService.swift
-│       │   └── ScreenTimeManager.swift
+│       │   ├── ScreenTimeManager.swift
+│       │   ├── DeviceActivityManager.swift  # iPad: configures DeviceActivityMonitor for focus sessions
+│       │   └── HandoffReceiver.swift        # Handles NSUserActivity from Mac + session join
 │       └── Shared/
 ├── macos/
 │   └── LockInBroMac/
@@ -1035,7 +1293,8 @@ focusflow/
 │       │   ├── SessionWindow.swift
 │       │   ├── ScreenshotEngine.swift
 │       │   ├── DistractionDetector.swift
-│       │   └── ContextCheckpoint.swift
+│       │   ├── ContextCheckpoint.swift
+│       │   └── HandoffAdvertiser.swift      # Publishes NSUserActivity for cross-device handoff
 │       ├── EyeTracking/
 │       │   ├── GazeTracker.swift
 │       │   └── L2CSNet.mlpackage
