@@ -62,7 +62,6 @@ FocusFlow is an ADHD-aware personal AI agent that helps adults with ADHD manage 
 - **Postgres:** Running on port 5432, database `focusapp` created
 - **nginx:** Proxying `wahwa.com` and `www.wahwa.com` to `localhost:3000`, SSL via Certbot
 - **PM2:** Killed (`pm2 kill`), `blinds_express` is stopped, port 3000 is free
-- **Cloudflare Tunnel:** Previously configured, can add new routes if needed
 - **Development:** SSH into server via VS Code Remote. Run Claude Code from local machine over SSH (don't install on droplet — saves RAM/disk).
 
 ---
@@ -680,7 +679,7 @@ Hex is a collaborative data platform for analytics notebooks. FocusFlow uses the
 
 ### Architecture: Hex in the Stack
 
-Hex connects directly to the `focusapp` Postgres database on the DigitalOcean droplet. Ensure port 5432 is accessible to Hex (add to firewall rules or use Cloudflare Tunnel). The backend triggers notebook runs via the Hex API, and clients fetch computed analytics.
+Hex connects directly to the `focusapp` Postgres database on the DigitalOcean droplet. Ensure port 5432 is accessible to Hex (add to firewall rules or something). The backend triggers notebook runs via the Hex API, and clients fetch computed analytics.
 
 ```
 Client Apps          Backend (FastAPI)           PostgreSQL (droplet)
@@ -848,7 +847,7 @@ async def run_notebook(notebook_key: str, user_id: str) -> dict:
 ### Hex Setup Steps
 
 1. Create Hex account (free tier)
-2. Add Postgres data connection: point to droplet IP, port 5432, database `focusapp`. (May need to open port 5432 in UFW or use Cloudflare Tunnel for secure access.)
+2. Add Postgres data connection: point to droplet IP, port 5432, database `focusapp`. (May need to open port 5432 in UFW.)
 3. Create 3 notebooks using the SQL/Python above
 4. Copy project IDs to backend `.env`:
    ```
