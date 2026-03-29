@@ -53,103 +53,97 @@ When the system detects the user looking at content that could mean different th
   - "Dismiss" (not relevant)
 - The system learns from past choices. After 5+ interactions where the user always picks "add to tasks" for Canvas notifications, it defaults to that and just asks for confirmation.
 
-### Screenshot History Buffer
+### Screenshot History Buffer (Updated from Implementation)
 
-The proactive detection system requires temporal context — a single screenshot can't detect "user is in a loop." The system maintains a rolling buffer:
+The proactive detection system requires temporal context — a single screenshot can't detect "user is in a loop." The system maintains a **two-tier rolling buffer**:
 
-- **Capture interval:** 5 seconds per screenshot during active focus sessions
-- **History depth:** 4 screenshots (20-second rolling window)
-- **VLM call frequency:** Every 5 seconds, the VLM receives the current screenshot + summaries of the last 3-4 analyses
-- **Token optimization:** Only the CURRENT screenshot is sent as an image. Previous screenshots are represented as their VLM analysis summaries (text only, ~50 tokens each). This keeps API costs manageable while providing temporal context.
-- **Buffer structure:** `deque(maxlen=4)` of `{screenshot_base64, vlm_analysis_summary, timestamp}`
+- **Capture interval:** 4 seconds per screenshot (tuned from 5s based on real latency testing — Gemini 3.1 Flash Lite responds in ~3.5s, leaving margin)
+- **Image tier:** `deque(maxlen=2)` of recent screenshots sent as actual images. ALL buffered screenshots are sent as images (not text summaries) so the VLM can visually diff between frames — detecting cursor movement, new text, scroll changes, window switches. This is critical: text summaries lose the fine-grained detail needed for temporal analysis.
+- **Text tier:** `deque(maxlen=12)` of older VLM summaries (~60s of history). When images roll off the image buffer, their text summaries persist here for extended context (e.g., "user read a problem description 60s ago").
+- **Previous output:** The VLM's last JSON output is fed back into the next prompt for self-refinement. This lets the model correct or build on its previous analysis rather than guessing from scratch.
+- **Execution context:** After the agentic executor completes an action, its summary is injected into the VLM prompt so the model knows the task was handled and can look for what the user does next.
+- **Buffer structure:** `HistoryBuffer(image_maxlen=2, text_maxlen=12)` with `_last_output` and `_last_execution` fields
 
-### Proactive Action Execution
+### Proactive Action Execution (Updated from Implementation)
 
-When friction is detected (confidence > 0.7), the system:
+When friction is detected and the VLM includes `proposed_actions`, the system:
 
-1. **Shows a non-intrusive action card** (not a notification — a floating UI element near the relevant screen region):
+1. **Deduplicates notifications.** A `NotificationManager` tracks the fingerprint (friction type + action labels) of the last shown card. Only shows a new card when the proposed action meaningfully changes — prevents spam.
+
+2. **Shows a non-intrusive action card:**
    ```
    ┌──────────────────────────────────────────────┐
-   │ 📋 I noticed you're copying events from an   │
-   │    image to Calendar.                         │
+   │ 🔧 Friction detected                         │
    │                                               │
-   │  [Extract all 14 events]  [Not now]           │
+   │ You're manually transcribing from a receipt.  │
+   │                                               │
+   │  [1] Extract receipt data to lunch.md         │
+   │  [0] Not now                                  │
    └──────────────────────────────────────────────┘
    ```
 
-2. **For ambiguous intent, shows multiple options:**
-   ```
-   ┌──────────────────────────────────────────────┐
-   │ 📝 Canvas assignment detected                 │
-   │                                               │
-   │  [Add to task list]  [Help me do it]  [Skip]  │
-   └──────────────────────────────────────────────┘
-   ```
+3. **On approval, an agentic executor runs.** Not a single-shot LLM call — a full agent loop (Gemini 3 Flash) with tool use:
+   - **Tools available:** `read_file`, `write_file` (existing text files only), `output` (display to user), `run_command`, `done`
+   - **Vision:** Executor receives all buffered screenshots so it can read source content (receipts, PDFs, code) directly from the images
+   - **Agent loop:** Gemini proposes tool calls → tools execute → results fed back → repeat (up to 10 steps)
+   - **File safety:** `write_file` only works on existing plain text files with a confirmed path. Binary format targets (docx, ppt, forms) use `output()` — user copies from the displayed result.
+   - **File discovery:** Agent uses `mdfind` (macOS Spotlight) or `lsof` to locate files by name when only the filename is visible on screen.
 
-3. **On approval, executes via the fastest available method:**
-   - **Priority 1:** AppleScript/Shortcuts for common macOS actions (instant, reliable)
-   - **Priority 2:** Direct API calls if the target app has one (e.g., Calendar API, Mail API)
-   - **Priority 3:** Claude Computer Use for complex multi-app workflows (slower but general)
+4. **Output routing:**
+   - **Existing text files (code, markdown, config):** Agent writes directly via `write_file` after confirming path with `read_file`
+   - **Binary/external targets (docx, ppt, website forms):** Agent uses `output()` to display content in a sticky-note UI. User copies.
+   - In production (Swift app), `output()` becomes a floating card / pasteboard copy.
 
-4. **Learns from preferences:** Store user choices in a `user_preferences` JSONB field. After 5+ consistent choices for the same pattern type, default to that action and just ask for one-tap confirmation.
+5. **Execution results fed back to VLM.** After the executor completes, its summary is injected into the VLM prompt so the model knows the task was handled and stops re-flagging the same friction.
 
-### Upgraded VLM Prompt (Friction Detection)
+6. **Learns from preferences:** Store user choices in a `user_preferences` JSONB field. After 5+ consistent choices for the same pattern type, default to that action and just ask for one-tap confirmation.
 
-The screenshot analysis prompt is upgraded from simple distraction detection to full friction pattern detection. It receives the current screenshot as an image PLUS text summaries of recent analyses:
+### Upgraded VLM Prompt (Updated from Implementation)
 
-```
-System: You are a proactive focus assistant analyzing a user's screen.
-The user's current task and step progress:
-  Task: {task_title}
-  Goal: {task_goal}
-  Steps:
-{formatted_steps_with_statuses_and_checkpoint_notes}
-  Window title reported by OS: {window_title}
+The VLM analyzes a **time sequence of screenshots** (not a single frame). The primary signal is the **diff between consecutive frames** — where pixels changed = where the user's attention is. Static content is background noise.
 
-Recent screen history (last 15-20 seconds):
-{recent_analysis_summaries}
+Key prompt design principles (learned from iteration):
+- **Diff-first analysis.** The prompt explicitly tells the model to compare frames and focus on what changed. An error that was ALREADY THERE in all frames is stale; an error that APPEARED between frames is relevant.
+- **Task inference from screen.** If no explicit task is set, the VLM infers the task from what the user is actively doing (where pixels change), not from static content.
+- **Fast friction detection.** Each frame is 4s apart. 2 unchanged frames = 8s idle = significant. Write-then-delete = stuck immediately. Repeated source→target switching = tedious_manual on the second switch.
+- **Rich proposed_actions.** The `details` field is a natural language spec for the agentic executor: what the user is trying to do, where to look in the screenshots, what format/style to match. The executor has vision too — tell it WHERE to look and WHAT to do, not the raw data.
+- **Session awareness.** The prompt includes open sessions from the backend so the VLM can detect task resumption and suggest session actions (resume, switch, complete, start new).
+- **Self-refinement.** Previous VLM output + execution results are fed back into the next prompt.
 
-Analyze the current screenshot in context of recent history. Determine:
-
-1. TASK STATUS: Is the user working on their task? Which step? Any steps completed?
-2. CHECKPOINT: What specific within-step progress have they made?
-3. FRICTION DETECTION: Is the user stuck in any of these patterns?
-   - REPETITIVE_LOOP: Switching between same 2-3 windows (copying data manually)
-   - STALLED: Same screen region with minimal changes for extended time
-   - TEDIOUS_MANUAL: Doing automatable work (filling forms, organizing files, transcribing)
-   - CONTEXT_OVERHEAD: Many windows open, visibly searching across them
-   - TASK_RESUMPTION: User just returned to a task they were working on earlier
-4. INTENT: If viewing informational content (notification, email, document), is the user:
-   - SKIMMING: Quick scan, likely wants to save/bookmark for later
-   - ENGAGED: Reading carefully, likely wants help completing related work
-   - UNCLEAR: Cannot determine — offer multiple options
-5. PROPOSED ACTION: If friction detected, suggest a specific action the AI could take.
-
-Respond ONLY with JSON:
+VLM JSON output schema:
+```json
 {
-  "on_task": boolean,
+  "on_task": true,
   "current_step_id": "step UUID or null",
-  "checkpoint_note_update": "within-step progress description or null",
+  "inferred_task": "what the user is actually working on, based on screen diffs",
+  "checkpoint_note_update": "what changed across these frames specifically",
   "steps_completed": ["UUIDs"],
   "friction": {
     "type": "repetitive_loop | stalled | tedious_manual | context_overhead | task_resumption | none",
     "confidence": 0.0-1.0,
-    "description": "what the user is struggling with",
+    "description": "what the user is struggling with, based on diff evidence",
     "proposed_actions": [
-      {"label": "Extract all 14 events", "action_type": "auto_extract", "details": "..."},
-      {"label": "Add to task list", "action_type": "brain_dump", "details": "..."}
+      {"label": "specific verb phrase", "action_type": "auto_extract | brain_dump | auto_fill | summarize | other", "details": "natural language spec for executor: what to do, where to look, what format"}
     ],
-    "source_context": "what info to extract from",
-    "target_context": "where to put it"
+    "source_context": "filename or app name",
+    "target_context": "filename or app name"
+  },
+  "session_action": {
+    "type": "resume | switch | complete | start_new | none",
+    "session_id": "uuid or null",
+    "reason": "why this session action is suggested"
   },
   "intent": "skimming | engaged | unclear | null",
   "distraction_type": "app_switch | browsing | idle | null",
-  "app_name": "string",
+  "app_name": "primary visible application",
   "confidence": 0.0-1.0,
-  "gentle_nudge": "nudge text if distracted and no friction action applies, null otherwise",
-  "vlm_summary": "1-sentence factual description of screen"
+  "gentle_nudge": "nudge text if distracted, null otherwise",
+  "vlm_summary": "1-sentence description of what CHANGED across frames"
 }
 ```
+
+VLM model: **Gemini 3.1 Flash Lite** (preview) — fast (~3.5s per call with 2 images), multimodal, free tier sufficient.
+Executor model: **Gemini 3 Flash** (preview) — more capable, agentic tool use for action execution.
 
 ### Notification Priority (Friction Help > Nudge)
 
@@ -236,13 +230,15 @@ This table feeds into preference learning: query past choices by `friction_type`
 ### Data Flows
 
 **Flow 1: Real-time Friction Detection + Distraction Detection (macOS, device-side VLM)**
-- ScreenCaptureKit captures a screenshot every 5 seconds during an active focus session
-- **VLM runs device-side:** Mac calls Gemini/Claude Vision API directly with current screenshot + text summaries of last 3-4 analyses (rolling `deque(maxlen=4)` buffer). Screenshots never leave the device except to the VLM API.
-- VLM returns enriched JSON: task status, step updates, friction detection (repetitive loops, stalls, tedious manual work), intent, and proposed proactive actions
+- ScreenCaptureKit captures a screenshot every **4 seconds** (tuned from 5s based on latency testing)
+- **VLM runs device-side:** Mac calls Gemini 3.1 Flash Lite API with **all buffered screenshots as images** (2 prior + 1 current = 3 images) plus text summaries of older analyses (12-entry text history). The VLM analyzes the **diff between consecutive frames** to detect user attention, friction patterns, and task state.
+- VLM returns enriched JSON: inferred task, step updates, friction detection, session actions, and proposed proactive actions with natural language specs for the executor
 - Mac sends **only the JSON result** (no image) to `POST /distractions/analyze-result` on the backend
 - Backend applies side-effects: updates step statuses + `checkpoint_note`, logs distractions, stores proactive actions for preference learning
-- If friction detected (confidence > 0.7): Mac shows action card locally. If distraction detected: Mac shows gentle nudge.
-- Screenshots discarded from device memory after VLM response (never persisted anywhere, never transit through backend)
+- If friction detected with proposed actions: Mac shows action card. User approves → **agentic executor** (Gemini 3 Flash) runs with tool use (read_file, write_file, output, run_command) up to 10 steps. Executor receives buffered screenshots for vision context.
+- If distraction detected: Mac shows gentle nudge
+- If session action detected (resume/switch/complete): Mac shows session card
+- Screenshots discarded from device memory after VLM response (never persisted, never transit through backend)
 
 **Flow 2: Brain-Dump Task Parsing (iOS, async)**
 - User speaks or types a stream-of-consciousness dump
@@ -252,11 +248,13 @@ This table feeds into preference learning: query past choices by `friction_type`
 - App asks "want me to break this into steps?" → `POST /tasks/{id}/plan` → Claude generates 5–15 min steps
 - User reviews, edits if needed, confirms
 
-**Flow 3: Focus Session + Auto-Update (macOS)**
-- User starts session → `POST /sessions/start` → returns full context (task title, steps with statuses, current step, overall goal)
-- Desktop captures periodic screenshots → VLM analyzes → auto-updates step statuses + checkpoint_note
+**Flow 3: Focus Session + Auto-Update (macOS, VLM-driven lifecycle)**
+- **Session start:** VLM runs in always-on mode. On startup (and periodically), fetches `GET /sessions/open` to get all active + interrupted sessions. When VLM detects the user working on something matching an existing task (same app + file), it suggests starting/resuming a session via `session_action` output. User approves → `POST /sessions/start` → returns full task context.
+- **During session:** VLM gets full task/step context in prompt. Auto-updates step statuses + checkpoint_note via `POST /distractions/analyze-result`.
+- **Session resume:** When VLM detects user returning to a previously-interrupted session (screen matches interrupted session's last app/file + time away > 5 min), it outputs `session_action: resume`. App calls `GET /sessions/{id}/resume` → shows context card: "You were on 'Write methods section' — got through 3 of 5 paragraphs. Results next."
+- **Session switch:** When VLM detects user moved to a different task matching another open session, it suggests switching.
+- **Session complete:** When VLM detects user finished (all steps done, or user moved to unrelated work for extended time), it suggests completing the session → `POST /sessions/{id}/end`.
 - On interruption, checkpoint saved → `POST /sessions/{id}/checkpoint`
-- On return → `GET /sessions/{id}/resume` → AI-generated context card: "You were on 'Write methods section' — you got through 3 of 5 paragraphs. Pick up at the results paragraph."
 
 **Flow 4: iPad Focus Session (iPadOS, app-based detection)**
 - User starts focus session on iPad → `POST /sessions/start` with `platform: "ipad"` + work app whitelist, OR joins existing Mac session via `POST /sessions/{id}/join` (triggered by tapping Live Activity / push notification / Handoff icon)
@@ -451,11 +449,18 @@ All timestamps are ISO 8601 UTC.
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | GET | `/sessions/active` | Get the current active session for the authenticated user. Returns 404 if none. |
-| POST | `/sessions/start` | Start focus session, optionally linked to a task. Returns full task context + all steps. |
+| GET | `/sessions/open` | **New.** All active + interrupted sessions for the user. Used by VLM on startup to enable session-aware analysis (task resumption detection, session switching). |
+| POST | `/sessions/start` | Start focus session, optionally linked to a task. Returns full task context + all steps. Can be triggered by VLM suggestion (user approves "Start focus session?" card). |
 | POST | `/sessions/{id}/checkpoint` | Save context checkpoint (current step, last action, attention score, active app) |
-| POST | `/sessions/{id}/end` | End session with status (completed / interrupted) |
+| POST | `/sessions/{id}/end` | End session with status (completed / interrupted). Can be triggered by VLM suggestion (user approves "Complete session?" card). |
 | POST | `/sessions/{id}/join` | Second device joins an active session. Returns full task context + suggested work app. Avoids duplicate sessions. |
 | GET | `/sessions/{id}/resume` | Get last checkpoint + step checkpoint_notes → AI-generated resume card |
+
+**VLM-driven session lifecycle:** The VLM operates in two modes:
+1. **Always-on (no session):** Runs at low cadence, infers task from screen. Can suggest starting a session when it detects the user working on something that matches an existing task.
+2. **Session mode:** VLM gets full task/step context from the session, sends results to backend via `POST /distractions/analyze-result`. Can suggest completing a session when it detects the user finished or moved on.
+
+The VLM fetches `GET /sessions/open` on startup and periodically, injecting all open sessions into its prompt. When it detects a screen match (same app + same file as an interrupted session), it outputs `session_action: {type: "resume", session_id: "..."}` and the app shows a resume card.
 
 ### Distraction Detection
 
