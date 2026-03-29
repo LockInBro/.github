@@ -59,15 +59,19 @@ The proactive detection system requires temporal context — a single screenshot
 
 - **Batched capture:** Screenshots captured every **2.5 seconds**, but VLM is called only every **4th capture** (~10 seconds). This gives the VLM 4 frames spanning 10 seconds of activity per call — enough temporal context for diff analysis while keeping API costs manageable.
 - **Image tier:** `deque(maxlen=4)` of recent screenshots, ALL sent as images. The VLM visually diffs between frames — detecting cursor movement, new text, scroll changes, window switches. Text summaries lose the fine-grained detail needed for temporal analysis.
+- **Batched capture:** Screenshots captured every **2.5 seconds**, but VLM is called only every **4th capture** (~10 seconds). This gives the VLM 4 frames spanning 10 seconds of activity per call — enough temporal context for diff analysis while keeping API costs manageable.
+- **Image tier:** `deque(maxlen=4)` of recent screenshots, ALL sent as images. The VLM visually diffs between frames — detecting cursor movement, new text, scroll changes, window switches. Text summaries lose the fine-grained detail needed for temporal analysis.
 - **Text tier:** `deque(maxlen=12)` of older VLM summaries (~60s of history). When images roll off the image buffer, their text summaries persist here for extended context (e.g., "user read a problem description 60s ago").
 - **Previous output:** The VLM's last JSON output is fed back into the next prompt for self-refinement. This lets the model correct or build on its previous analysis rather than guessing from scratch.
 - **Execution context:** After the agentic executor completes an action, its summary is injected into the VLM prompt so the model knows the task was handled and can look for what the user does next.
+- **Buffer structure:** `HistoryBuffer(image_maxlen=4, text_maxlen=12)` with `_last_output` and `_last_execution` fields
 - **Buffer structure:** `HistoryBuffer(image_maxlen=4, text_maxlen=12)` with `_last_output` and `_last_execution` fields
 
 ### Proactive Action Execution (Updated from Implementation)
 
 When friction is detected and the VLM includes `proposed_actions`, the system:
 
+1. **Deduplicates notifications and filters by action type.** A `NotificationManager` tracks the fingerprint (friction type + action labels) of the last shown card. Only shows a new card when the proposed action meaningfully changes — prevents spam. Additionally, only actions with executor-actionable types (`auto_extract`, `auto_fill`, `summarize`, `brain_dump`) trigger friction cards. Generic suggestions (`action_type: "other"`) fall through to the gentle nudge path instead.
 1. **Deduplicates notifications and filters by action type.** A `NotificationManager` tracks the fingerprint (friction type + action labels) of the last shown card. Only shows a new card when the proposed action meaningfully changes — prevents spam. Additionally, only actions with executor-actionable types (`auto_extract`, `auto_fill`, `summarize`, `brain_dump`) trigger friction cards. Generic suggestions (`action_type: "other"`) fall through to the gentle nudge path instead.
 
 2. **Shows a non-intrusive action card:**
@@ -142,8 +146,13 @@ VLM JSON output schema:
 }
 ```
 
-VLM model: **Gemini 2.5 Pro** — strong instruction following, handles complex multi-rule prompts reliably. Called every ~10s with 4 frames.
-Executor model: **Gemini 3 Flash** (preview) — fast, agentic tool use for action execution with 429 retry logic.
+VLM model: **Gemini 2.5 Pro** — strong instruction following, handles complex multi-rule prompts reliably. Called every ~10s with 4 frames batched at 2.5s intervals.
+Executor model: **Gemini 2.5 Pro** — agentic tool use with vision for action execution. 429 retry logic. Tools: `read_file`, `write_file` (existing text files only), `output` (display to user), `run_command`, `done`.
+
+Key learnings from implementation:
+- **VLM proposed_actions.details must specify output format explicitly** — the executor will default to JSON unless told "format as plain text matching what the user already wrote." The VLM should quote the user's existing text style.
+- **Executor prefers vision for binary files** (PDFs, images, receipts) and `read_file` for text files (code, markdown, configs).
+- **Capture is batched, not per-call** — screenshots taken every 2.5s, VLM called every 4th capture (~10s). This gives temporal context while keeping API costs manageable.
 
 ### Notification Priority (Friction Help > Nudge)
 
@@ -230,6 +239,8 @@ This table feeds into preference learning: query past choices by `friction_type`
 ### Data Flows
 
 **Flow 1: Real-time Friction Detection + Distraction Detection (macOS, device-side VLM)**
+- ScreenCaptureKit captures a screenshot every **2.5 seconds**. VLM is called every **4th capture** (~10 seconds) with all 4 frames batched together.
+- **VLM runs device-side:** Mac calls Gemini 2.5 Pro API with **4 screenshots as images** spanning ~10 seconds, plus text summaries of older analyses (12-entry text history). The VLM analyzes the **diff between consecutive frames** to detect user attention, friction patterns, and task state.
 - ScreenCaptureKit captures a screenshot every **2.5 seconds**. VLM is called every **4th capture** (~10 seconds) with all 4 frames batched together.
 - **VLM runs device-side:** Mac calls Gemini 2.5 Pro API with **4 screenshots as images** spanning ~10 seconds, plus text summaries of older analyses (12-entry text history). The VLM analyzes the **diff between consecutive frames** to detect user attention, friction patterns, and task state.
 - VLM returns enriched JSON: inferred task, step updates, friction detection, session actions, and proposed proactive actions with natural language specs for the executor
@@ -461,6 +472,34 @@ All timestamps are ISO 8601 UTC.
 2. **Session mode:** VLM gets full task/step context from the session, sends results to backend via `POST /distractions/analyze-result`. Can suggest completing a session when it detects the user finished or moved on.
 
 The VLM fetches `GET /sessions/open` on startup and periodically, injecting all open sessions into its prompt. When it detects a screen match (same app + same file as an interrupted session), it outputs `session_action: {type: "resume", session_id: "..."}` and the app shows a resume card.
+
+**GET /sessions/open — Response (200):**
+```json
+[
+  {
+    "id": "uuid",
+    "task_id": "uuid or null",
+    "task": {
+      "title": "Solve A+B problem",
+      "goal": "Write a working C++ solution"
+    },
+    "status": "interrupted",
+    "platform": "mac",
+    "started_at": "ISO 8601",
+    "ended_at": "ISO 8601 or null",
+    "checkpoint": {
+      "active_app": "VS Code",
+      "active_file": "solution.cpp",
+      "current_step_id": "uuid or null",
+      "last_action_summary": "stuck on implementation"
+    }
+  }
+]
+```
+The VLM prompt receives each session formatted as:
+```
+session_id="uuid" [interrupted] "Solve A+B problem" — last in VS Code/solution.cpp, "stuck on implementation" (paused 30m ago)
+```
 
 ### Distraction Detection
 
