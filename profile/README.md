@@ -57,18 +57,18 @@ When the system detects the user looking at content that could mean different th
 
 The proactive detection system requires temporal context — a single screenshot can't detect "user is in a loop." The system maintains a **two-tier rolling buffer**:
 
-- **Capture interval:** 4 seconds per screenshot (tuned from 5s based on real latency testing — Gemini 3.1 Flash Lite responds in ~3.5s, leaving margin)
-- **Image tier:** `deque(maxlen=2)` of recent screenshots sent as actual images. ALL buffered screenshots are sent as images (not text summaries) so the VLM can visually diff between frames — detecting cursor movement, new text, scroll changes, window switches. This is critical: text summaries lose the fine-grained detail needed for temporal analysis.
+- **Batched capture:** Screenshots captured every **2.5 seconds**, but VLM is called only every **4th capture** (~10 seconds). This gives the VLM 4 frames spanning 10 seconds of activity per call — enough temporal context for diff analysis while keeping API costs manageable.
+- **Image tier:** `deque(maxlen=4)` of recent screenshots, ALL sent as images. The VLM visually diffs between frames — detecting cursor movement, new text, scroll changes, window switches. Text summaries lose the fine-grained detail needed for temporal analysis.
 - **Text tier:** `deque(maxlen=12)` of older VLM summaries (~60s of history). When images roll off the image buffer, their text summaries persist here for extended context (e.g., "user read a problem description 60s ago").
 - **Previous output:** The VLM's last JSON output is fed back into the next prompt for self-refinement. This lets the model correct or build on its previous analysis rather than guessing from scratch.
 - **Execution context:** After the agentic executor completes an action, its summary is injected into the VLM prompt so the model knows the task was handled and can look for what the user does next.
-- **Buffer structure:** `HistoryBuffer(image_maxlen=2, text_maxlen=12)` with `_last_output` and `_last_execution` fields
+- **Buffer structure:** `HistoryBuffer(image_maxlen=4, text_maxlen=12)` with `_last_output` and `_last_execution` fields
 
 ### Proactive Action Execution (Updated from Implementation)
 
 When friction is detected and the VLM includes `proposed_actions`, the system:
 
-1. **Deduplicates notifications.** A `NotificationManager` tracks the fingerprint (friction type + action labels) of the last shown card. Only shows a new card when the proposed action meaningfully changes — prevents spam.
+1. **Deduplicates notifications and filters by action type.** A `NotificationManager` tracks the fingerprint (friction type + action labels) of the last shown card. Only shows a new card when the proposed action meaningfully changes — prevents spam. Additionally, only actions with executor-actionable types (`auto_extract`, `auto_fill`, `summarize`, `brain_dump`) trigger friction cards. Generic suggestions (`action_type: "other"`) fall through to the gentle nudge path instead.
 
 2. **Shows a non-intrusive action card:**
    ```
@@ -142,8 +142,8 @@ VLM JSON output schema:
 }
 ```
 
-VLM model: **Gemini 3.1 Flash Lite** (preview) — fast (~3.5s per call with 2 images), multimodal, free tier sufficient.
-Executor model: **Gemini 3 Flash** (preview) — more capable, agentic tool use for action execution.
+VLM model: **Gemini 2.5 Pro** — strong instruction following, handles complex multi-rule prompts reliably. Called every ~10s with 4 frames.
+Executor model: **Gemini 3 Flash** (preview) — fast, agentic tool use for action execution with 429 retry logic.
 
 ### Notification Priority (Friction Help > Nudge)
 
@@ -230,8 +230,8 @@ This table feeds into preference learning: query past choices by `friction_type`
 ### Data Flows
 
 **Flow 1: Real-time Friction Detection + Distraction Detection (macOS, device-side VLM)**
-- ScreenCaptureKit captures a screenshot every **4 seconds** (tuned from 5s based on latency testing)
-- **VLM runs device-side:** Mac calls Gemini 3.1 Flash Lite API with **all buffered screenshots as images** (2 prior + 1 current = 3 images) plus text summaries of older analyses (12-entry text history). The VLM analyzes the **diff between consecutive frames** to detect user attention, friction patterns, and task state.
+- ScreenCaptureKit captures a screenshot every **2.5 seconds**. VLM is called every **4th capture** (~10 seconds) with all 4 frames batched together.
+- **VLM runs device-side:** Mac calls Gemini 2.5 Pro API with **4 screenshots as images** spanning ~10 seconds, plus text summaries of older analyses (12-entry text history). The VLM analyzes the **diff between consecutive frames** to detect user attention, friction patterns, and task state.
 - VLM returns enriched JSON: inferred task, step updates, friction detection, session actions, and proposed proactive actions with natural language specs for the executor
 - Mac sends **only the JSON result** (no image) to `POST /distractions/analyze-result` on the backend
 - Backend applies side-effects: updates step statuses + `checkpoint_note`, logs distractions, stores proactive actions for preference learning
