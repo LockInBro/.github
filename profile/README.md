@@ -442,13 +442,15 @@ All timestamps are ISO 8601 UTC.
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | GET | `/tasks/{id}/steps` | List all steps for a task (ordered by sort_order) |
-| PATCH | `/steps/{id}` | Update step fields (status, checkpoint_note, etc.) |
+| PATCH | `/steps/{id}` | Update step fields (title, description, estimated_minutes, sort_order, status, checkpoint_note) |
 | POST | `/steps/{id}/complete` | Mark step as done with completed_at timestamp |
+| DELETE | `/steps/{id}` | Hard-delete a step (ownership verified via parent task) |
 
 ### Sessions
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
+| GET | `/sessions/active` | Get the current active session for the authenticated user. Returns 404 if none. |
 | POST | `/sessions/start` | Start focus session, optionally linked to a task. Returns full task context + all steps. |
 | POST | `/sessions/{id}/checkpoint` | Save context checkpoint (current step, last action, attention score, active app) |
 | POST | `/sessions/{id}/end` | End session with status (completed / interrupted) |
@@ -719,6 +721,27 @@ task_context: JSON string (same shape as before)
 }
 ```
 
+### GET /sessions/active
+
+**Request:** None (authenticated via JWT).
+
+**Response (200):** Same `SessionOut` shape as start:
+```json
+{
+  "id": "uuid",
+  "user_id": "uuid",
+  "task_id": "uuid | null",
+  "platform": "mac",
+  "started_at": "ISO 8601",
+  "ended_at": null,
+  "status": "active",
+  "checkpoint": {},
+  "created_at": "ISO 8601"
+}
+```
+
+**404** if no active session exists. Used by the frontend to recover a stale session ID after app restart — the client can then call `POST /sessions/{id}/end` to clear it before starting a new session.
+
 ### POST /sessions/start
 
 **Request:**
@@ -747,7 +770,7 @@ task_context: JSON string (same shape as before)
 ```
 
 **Backend side-effects:**
-1. Enforces one active session per user — returns 409 if one already exists
+1. Enforces one active session per user — returns 409 with `{"message": "...", "active_session_id": "uuid"}` if one already exists
 2. Sends push notification to user's other devices (APNs)
 3. Sends ActivityKit push to start Live Activity on iPad (if session started on Mac)
 
@@ -808,6 +831,10 @@ All fields optional — checkpoint is a JSONB merge, so only provided fields are
 **Request (all fields optional):**
 ```json
 {
+  "title": "Updated step title",
+  "description": "Updated description",
+  "estimated_minutes": 15,
+  "sort_order": 3,
   "status": "in_progress | done | skipped",
   "checkpoint_note": "wrote 3 of 5 paragraphs, results section is next"
 }
@@ -839,6 +866,14 @@ Used by iPad manual step updates and voice checkpoint notes. Same endpoint the V
 **Response (200):** Same `StepOut` shape with `status: "done"` and `completed_at` set.
 
 Convenience endpoint — equivalent to `PATCH /steps/{id}` with `{"status": "done"}` but also sets `completed_at = now()`.
+
+### DELETE /steps/{id}
+
+**Request:** None (empty body).
+
+**Response:** 204 No Content.
+
+Hard-deletes a step. Ownership is verified by joining through the parent task's `user_id`. Returns 404 if the step doesn't exist or belongs to another user.
 
 ### Device Token Registration
 
